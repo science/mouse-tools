@@ -133,14 +133,15 @@ class TestDelayedDebouncedMouse:
         assert ecodes.BTN_LEFT not in mouse.pending_release
 
     def test_bounce_suppressed(self, debounce_module):
-        """A release followed by a fast re-press should suppress both."""
+        """A release followed by a fast re-press should suppress both (drag bounce)."""
         from evdev import ecodes
 
         mouse, uinput = self._make_mouse(debounce_module, threshold_ms=60)
 
-        # Initial press
+        # Initial press — hold long enough to be a drag (>=150ms)
         press1 = make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1)
         mouse.process_event(press1)
+        time.sleep(0.2)  # 200ms hold = drag
         uinput.write_event.reset_mock()
 
         # Release (queued in pending)
@@ -211,6 +212,7 @@ class TestDelayedDebouncedMouse:
         mouse, uinput = self._make_mouse(debounce_module, threshold_ms=60)
 
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)  # 200ms hold = drag, so bounce suppression applies
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
         # Bounce re-press
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
@@ -248,6 +250,133 @@ class TestDelayedDebouncedMouse:
 
         assert result is True
         uinput.write_event.assert_called_once_with(ev)
+
+
+class TestHoldAwareDebounce:
+    """Tests for hold-duration-aware debounce.
+
+    The debounce should distinguish between:
+    - Fast double-clicks: short hold (<150ms), release, fast re-press → ALLOW
+    - Drag bounce: long hold (>=150ms), phantom release, fast re-press → SUPPRESS
+
+    This prevents the debounce filter from eating legitimate fast double-clicks
+    while still catching switch bounce during drags.
+    """
+
+    def _make_mouse(self, debounce_module, threshold_ms=60, hold_threshold_ms=150):
+        from evdev import ecodes
+
+        mock_device = MagicMock()
+        mock_device.name = "Test Mouse"
+        mock_device.fd = 99
+        mock_uinput = MagicMock()
+
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.from_device.return_value = mock_uinput
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, threshold_ms,
+                hold_threshold_ms=hold_threshold_ms, quiet=True,
+            )
+        return mouse, mock_uinput
+
+    def test_fast_double_click_not_suppressed(self, debounce_module):
+        """Short click followed by fast re-press = legitimate double-click.
+
+        Simulates: press (hold 50ms) → release → press 30ms later.
+        The hold was short (<150ms), so this should NOT be debounced.
+        """
+        from evdev import ecodes
+
+        mouse, uinput = self._make_mouse(debounce_module,
+                                          threshold_ms=60, hold_threshold_ms=150)
+
+        # First click: short hold
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.050)  # 50ms hold = short click
+
+        # Release
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        uinput.write_event.reset_mock()
+
+        # Fast re-press (30ms later, within debounce threshold)
+        time.sleep(0.030)
+        press2 = make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1)
+        result = mouse.process_event(press2)
+
+        # Should NOT be suppressed — this is a fast double-click
+        assert result is True
+        assert mouse.suppressed == 0
+
+    def test_drag_bounce_still_suppressed(self, debounce_module):
+        """Long hold followed by fast re-press = drag bounce.
+
+        Simulates: press (hold 300ms) → phantom release → re-press 40ms later.
+        The hold was long (>=150ms), so this IS bounce and should be suppressed.
+        """
+        from evdev import ecodes
+
+        mouse, uinput = self._make_mouse(debounce_module,
+                                          threshold_ms=60, hold_threshold_ms=150)
+
+        # Press and hold for a long drag
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.300)  # 300ms hold = drag
+
+        # Phantom release (switch bounce)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        uinput.write_event.reset_mock()
+
+        # Bounce re-press 40ms later
+        time.sleep(0.040)
+        press2 = make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1)
+        result = mouse.process_event(press2)
+
+        # Should be suppressed — this is drag bounce
+        assert result is False
+        assert mouse.suppressed == 1
+
+    def test_hold_at_boundary_is_debounced(self, debounce_module):
+        """Hold exactly at the hold threshold should be treated as a drag."""
+        from evdev import ecodes
+
+        mouse, uinput = self._make_mouse(debounce_module,
+                                          threshold_ms=60, hold_threshold_ms=150)
+
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.160)  # Just over 150ms
+
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        uinput.write_event.reset_mock()
+
+        time.sleep(0.030)
+        result = mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+
+        assert result is False
+        assert mouse.suppressed == 1
+
+    def test_short_hold_release_still_delayed(self, debounce_module):
+        """Even for short holds, the release should still be held briefly
+        then flushed (so uinput gets a clean event). The key difference
+        is that a re-press during the hold window is NOT suppressed."""
+        from evdev import ecodes
+
+        mouse, uinput = self._make_mouse(debounce_module,
+                                          threshold_ms=60, hold_threshold_ms=150)
+
+        # Short click
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.050)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+
+        # Release should be pending (not forwarded immediately)
+        assert ecodes.BTN_LEFT in mouse.pending_release
+
+        # Wait for flush
+        time.sleep(0.07)
+        mouse.flush_pending()
+
+        # Release should now be forwarded
+        assert ecodes.BTN_LEFT not in mouse.pending_release
 
 
 class TestFlushSynReport:
@@ -321,15 +450,16 @@ class TestFlushSynReport:
     def test_suppressed_bounce_no_syn(self, debounce_module):
         """When bounce is suppressed, no SYN_REPORT should be emitted.
 
-        If a release is pending and a re-press arrives (bounce), both are
+        If a release is pending and a re-press arrives (drag bounce), both are
         suppressed. No events should be written, including no SYN_REPORT.
         """
         from evdev import ecodes
 
         mouse, uinput = self._make_mouse(debounce_module, threshold_ms=60)
 
-        # Press
+        # Press and hold long enough to be a drag
         mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)  # 200ms hold = drag
         uinput.write_event.reset_mock()
 
         # Release (pending)

@@ -36,6 +36,7 @@ except ImportError:
 
 
 DEBOUNCE_MS = 60
+HOLD_THRESHOLD_MS = 150  # Hold longer than this = drag (debounce applies)
 BUTTON_CODES = {ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE,
                 ecodes.BTN_SIDE, ecodes.BTN_EXTRA}
 
@@ -167,16 +168,20 @@ class DelayedDebouncedMouse:
     The added latency (60ms default) is imperceptible for normal use.
     """
 
-    def __init__(self, device, threshold_ms, warn_threshold_ms=None, quiet=False,
-                 lag_threshold_ms=10):
+    def __init__(self, device, threshold_ms, warn_threshold_ms=None,
+                 hold_threshold_ms=None, quiet=False, lag_threshold_ms=10):
         self.device = device
         self.threshold_s = threshold_ms / 1000.0
         self.warn_threshold_s = (warn_threshold_ms or 100) / 1000.0
+        self.hold_threshold_s = (hold_threshold_ms if hold_threshold_ms is not None
+                                 else HOLD_THRESHOLD_MS) / 1000.0
         self.quiet = quiet
         self.name = device.name
         self.lag_threshold_ms = lag_threshold_ms
-        # Per-button: pending release event and its timestamp
-        self.pending_release = {}   # btn -> (event, monotonic_time)
+        # Per-button: pending release event, its timestamp, and hold duration
+        self.pending_release = {}   # btn -> (event, monotonic_time, was_drag)
+        # Per-button: when the button was pressed (for hold duration calc)
+        self.press_time = {}        # btn -> monotonic_time
         # Per-button: last forwarded release - both original and forwarded times
         self.last_forwarded_release = {}  # btn -> (original_ts, forwarded_ts)
         self.suppressed = 0
@@ -228,18 +233,30 @@ class DelayedDebouncedMouse:
 
         if event.value == 1:  # Press
             self.total_clicks += 1
+            self.press_time[btn] = now
             if btn in self.pending_release:
-                # A release was pending and a press came before threshold expired.
-                # This is bounce - suppress both the pending release and this press.
-                _, release_ts = self.pending_release[btn]
+                _, release_ts, was_drag = self.pending_release[btn]
                 gap_ms = (now - release_ts) * 1000
-                del self.pending_release[btn]
-                self.suppressed += 1
-                btn_name = {272: "LEFT", 273: "RIGHT", 274: "MIDDLE",
-                            275: "SIDE", 276: "EXTRA"}.get(btn, str(btn))
-                log(f"SUPPRESSED bounce on {self.name}: {btn_name} "
-                    f"gap={gap_ms:.1f}ms (suppressed={self.suppressed} total)")
-                return False
+
+                if was_drag:
+                    # Long hold followed by fast re-press = drag bounce → suppress
+                    del self.pending_release[btn]
+                    self.suppressed += 1
+                    btn_name = {272: "LEFT", 273: "RIGHT", 274: "MIDDLE",
+                                275: "SIDE", 276: "EXTRA"}.get(btn, str(btn))
+                    log(f"SUPPRESSED bounce on {self.name}: {btn_name} "
+                        f"gap={gap_ms:.1f}ms (suppressed={self.suppressed} total)")
+                    return False
+                else:
+                    # Short hold followed by fast re-press = fast double-click → allow
+                    # Flush the pending release immediately, then forward the press
+                    pending_event, pending_ts, _ = self.pending_release.pop(btn)
+                    self.uinput.write_event(pending_event)
+                    syn = evdev.InputEvent(0, 0, ecodes.EV_SYN, ecodes.SYN_REPORT, 0)
+                    self.uinput.write_event(syn)
+                    self.last_forwarded_release[btn] = (pending_ts, now)
+                    self.uinput.write_event(event)
+                    return True
             else:
                 # Normal press - check for near-miss (above threshold but suspicious)
                 last_rel = self.last_forwarded_release.get(btn)
@@ -258,8 +275,12 @@ class DelayedDebouncedMouse:
                 return True
 
         elif event.value == 0:  # Release
+            # Compute hold duration to distinguish clicks from drags
+            hold_start = self.press_time.get(btn, now)
+            hold_duration = now - hold_start
+            was_drag = hold_duration >= self.hold_threshold_s
             # Don't forward yet - hold it for the debounce window
-            self.pending_release[btn] = (event, now)
+            self.pending_release[btn] = (event, now, was_drag)
             return True  # Queued, not yet forwarded
 
         else:
@@ -275,7 +296,7 @@ class DelayedDebouncedMouse:
         """
         now = time.monotonic()
         expired = []
-        for btn, (event, orig_ts) in self.pending_release.items():
+        for btn, (event, orig_ts, _was_drag) in self.pending_release.items():
             if now - orig_ts >= self.threshold_s:
                 expired.append(btn)
                 self.uinput.write_event(event)
@@ -291,13 +312,13 @@ class DelayedDebouncedMouse:
         if not self.pending_release:
             return None
         now = time.monotonic()
-        earliest = min(ts for _, ts in self.pending_release.values())
+        earliest = min(ts for _, ts, _ in self.pending_release.values())
         remaining = self.threshold_s - (now - earliest)
         return max(0, remaining)
 
     def close(self):
         # Flush any remaining pending releases
-        for btn, (event, ts) in self.pending_release.items():
+        for btn, (event, ts, _) in self.pending_release.items():
             self.uinput.write_event(event)
         self.pending_release.clear()
         try:
@@ -319,6 +340,9 @@ def main():
     parser.add_argument("--warn-threshold", type=int, default=100,
                         help="Log NEAR-MISS for release->press gaps between "
                              "threshold and this value in ms (default: 100)")
+    parser.add_argument("--hold-threshold", type=int, default=HOLD_THRESHOLD_MS,
+                        help="Only debounce releases after holds longer than this (ms). "
+                             f"Short clicks below this are never debounced. (default: {HOLD_THRESHOLD_MS})")
     parser.add_argument("--lag-threshold", type=int, default=10,
                         help="Log LAG_SPIKE when event processing lags more than "
                              "this many ms behind the kernel timestamp (default: 10)")
@@ -356,6 +380,7 @@ def main():
         try:
             dm = DelayedDebouncedMouse(dev, args.threshold,
                                        warn_threshold_ms=args.warn_threshold,
+                                       hold_threshold_ms=args.hold_threshold,
                                        quiet=args.quiet,
                                        lag_threshold_ms=args.lag_threshold)
             mice.append(dm)
