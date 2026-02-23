@@ -70,6 +70,7 @@ def find_mice():
             continue
         # Skip virtual devices (our own output, input-remapper, etc.)
         if "uinput" in (dev.phys or "").lower() or "input-remapper" in dev.name.lower():
+            dev.close()
             continue
         caps = dev.capabilities()
         key_caps = caps.get(ecodes.EV_KEY, [])
@@ -77,6 +78,8 @@ def find_mice():
         # Must have BTN_LEFT and relative axes (mouse movement)
         if ecodes.BTN_LEFT in key_caps and ecodes.REL_X in rel_caps:
             mice.append(dev)
+        else:
+            dev.close()
     return mice
 
 
