@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""
+Mouse drag telemetry monitor.
+
+Monitors the raw evdev stream from the MX Anywhere 2S and X11 focus changes
+to diagnose phantom button-release events during drags.
+
+Only logs data when left button is held (drag in progress), and highlights
+anomalies: unexpected releases, very short drags, and focus changes mid-drag.
+
+Requires: sudo (for evdev access) or membership in 'input' group.
+Usage: sudo mouse-drag-monitor [--device /dev/input/eventN]
+"""
+
+import argparse
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+try:
+    import evdev
+    from evdev import ecodes
+except ImportError:
+    print("Error: python3-evdev required. Install: sudo apt install python3-evdev",
+          file=sys.stderr)
+    sys.exit(1)
+
+
+# --- Constants ---
+BTN_LEFT = ecodes.BTN_LEFT        # 272
+BTN_RIGHT = ecodes.BTN_RIGHT      # 273
+BTN_MIDDLE = ecodes.BTN_MIDDLE    # 274
+ANOMALY_THRESHOLD_MS = 150        # Release < this after press = suspicious
+SHORT_DRAG_THRESHOLD_MS = 80      # Drag shorter than this = bounce
+FOCUS_GRACE_MS = 50               # Ignore focus changes in first N ms (click-to-focus)
+# Use SUDO_USER's home, not root's
+_real_user = os.environ.get("SUDO_USER", os.environ.get("USER", "root"))
+_real_home = Path(f"/home/{_real_user}") if _real_user != "root" else Path.home()
+LOG_DIR = _real_home / ".local" / "share" / "mouse-drag-monitor"
+LOG_FILE = LOG_DIR / "drag-events.log"
+MAX_LOG_SIZE = 10 * 1024 * 1024   # 10 MB rotation threshold
+
+
+# --- Focus monitor (runs in background thread) ---
+class FocusMonitor:
+    """Watches _NET_ACTIVE_WINDOW via xprop -spy on root window."""
+
+    def __init__(self):
+        self.current_window = "unknown"
+        self.changes = deque(maxlen=100)  # Recent focus changes with timestamps
+        self._proc = None
+        self._thread = None
+        self._stop = threading.Event()
+
+    def start(self):
+        display = os.environ.get("DISPLAY", ":0")
+        try:
+            self._proc = subprocess.Popen(
+                ["xprop", "-root", "-spy", "_NET_ACTIVE_WINDOW"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ, "DISPLAY": display},
+                text=True,
+            )
+        except FileNotFoundError:
+            print("Warning: xprop not found, focus monitoring disabled",
+                  file=sys.stderr)
+            return
+
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+
+        # Also get initial window name
+        self._update_window_name_async()
+
+    def _read_loop(self):
+        for line in self._proc.stdout:
+            if self._stop.is_set():
+                break
+            ts = time.monotonic()
+            # Parse: _NET_ACTIVE_WINDOW(WINDOW): window id # 0x4600004
+            if "0x" in line:
+                wid = line.strip().split()[-1]
+                name = self._get_window_name(wid)
+                self.current_window = f"{wid} ({name})"
+                self.changes.append((ts, self.current_window))
+
+    def _get_window_name(self, wid):
+        try:
+            display = os.environ.get("DISPLAY", ":0")
+            result = subprocess.run(
+                ["xprop", "-id", wid, "WM_NAME"],
+                capture_output=True, text=True, timeout=1,
+                env={**os.environ, "DISPLAY": display},
+            )
+            # WM_NAME(UTF8_STRING) = "Window Title"
+            if "=" in result.stdout:
+                return result.stdout.split("=", 1)[1].strip().strip('"')
+        except Exception:
+            pass
+        return "?"
+
+    def _update_window_name_async(self):
+        """Get the current active window at startup."""
+        try:
+            display = os.environ.get("DISPLAY", ":0")
+            result = subprocess.run(
+                ["xprop", "-root", "_NET_ACTIVE_WINDOW"],
+                capture_output=True, text=True, timeout=2,
+                env={**os.environ, "DISPLAY": display},
+            )
+            if "0x" in result.stdout:
+                wid = result.stdout.strip().split()[-1]
+                name = self._get_window_name(wid)
+                self.current_window = f"{wid} ({name})"
+        except Exception:
+            pass
+
+    def focus_changes_since(self, since_ts):
+        """Return list of (timestamp, window) changes since given monotonic time."""
+        return [(ts, win) for ts, win in self.changes if ts >= since_ts]
+
+    def stop(self):
+        self._stop.set()
+        if self._proc:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+
+
+# --- BT adapter suspend monitor ---
+class BTSuspendMonitor:
+    """Periodically checks BT adapter runtime_status for suspend events."""
+
+    def __init__(self, adapter_path="/sys/bus/usb/devices/1-14"):
+        self.adapter_path = Path(adapter_path)
+        self.status_file = self.adapter_path / "power" / "runtime_status"
+        self.suspended_file = self.adapter_path / "power" / "runtime_suspended_time"
+        self.last_suspended_time = self._read_suspended_time()
+        self.last_status = self._read_status()
+        self.events = deque(maxlen=100)
+        self._thread = None
+        self._stop = threading.Event()
+
+    def _read_status(self):
+        try:
+            return self.status_file.read_text().strip()
+        except Exception:
+            return "unknown"
+
+    def _read_suspended_time(self):
+        try:
+            return int(self.suspended_file.read_text().strip())
+        except Exception:
+            return 0
+
+    def start(self):
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+
+    def _poll_loop(self):
+        while not self._stop.is_set():
+            status = self._read_status()
+            suspended_time = self._read_suspended_time()
+
+            if status != self.last_status:
+                ts = time.monotonic()
+                self.events.append((ts, self.last_status, status))
+                self.last_status = status
+
+            if suspended_time > self.last_suspended_time:
+                # BT adapter was suspended between polls
+                delta = suspended_time - self.last_suspended_time
+                ts = time.monotonic()
+                self.events.append((ts, "suspended_delta_ms", delta))
+                self.last_suspended_time = suspended_time
+
+            self._stop.wait(0.05)  # Poll every 50ms
+
+    def events_since(self, since_ts):
+        return [(ts, *rest) for ts, *rest in self.events if ts >= since_ts]
+
+    def stop(self):
+        self._stop.set()
+
+
+# --- Main monitor ---
+def find_mx_anywhere():
+    """Auto-detect MX Anywhere 2S event device."""
+    for dev in [evdev.InputDevice(p) for p in evdev.list_devices()]:
+        if "MX Anywhere 2S" in dev.name and "forwarded" not in dev.name:
+            if ecodes.BTN_LEFT in dev.capabilities().get(ecodes.EV_KEY, []):
+                return dev.path
+    return None
+
+
+def setup_logging():
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if LOG_FILE.exists() and LOG_FILE.stat().st_size > MAX_LOG_SIZE:
+        rotated = LOG_FILE.with_suffix(".log.1")
+        LOG_FILE.rename(rotated)
+
+
+def log(msg, also_print=False):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    line = f"[{ts}] {msg}"
+    with open(LOG_FILE, "a") as f:
+        f.write(line + "\n")
+    if also_print:
+        print(line)
+
+
+def format_ms(mono_start, mono_end):
+    return f"{(mono_end - mono_start) * 1000:.1f}ms"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Mouse drag telemetry monitor")
+    parser.add_argument("--device", help="evdev device path (auto-detected if omitted)")
+    parser.add_argument("--bt-adapter", default="/sys/bus/usb/devices/1-14",
+                        help="sysfs path to BT USB adapter")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Only log anomalies, skip normal drag summaries")
+    parser.add_argument("--threshold", type=int, default=ANOMALY_THRESHOLD_MS,
+                        help=f"Anomaly threshold in ms (default: {ANOMALY_THRESHOLD_MS})")
+    args = parser.parse_args()
+
+    # Find device
+    dev_path = args.device or find_mx_anywhere()
+    if not dev_path:
+        print("Error: Could not find MX Anywhere 2S. Specify --device /dev/input/eventN",
+              file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        device = evdev.InputDevice(dev_path)
+    except PermissionError:
+        print(f"Error: Permission denied on {dev_path}. Run with sudo or add user to input group.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    setup_logging()
+
+    # Start monitors
+    focus = FocusMonitor()
+    focus.start()
+
+    bt_monitor = BTSuspendMonitor(args.bt_adapter)
+    bt_monitor.start()
+
+    def cleanup(sig=None, frame=None):
+        focus.stop()
+        bt_monitor.stop()
+        log("Monitor stopped", also_print=True)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    log(f"Monitor started: device={device.name} ({dev_path}), "
+        f"threshold={args.threshold}ms, bt_adapter={args.bt_adapter}", also_print=True)
+    log(f"Log file: {LOG_FILE}", also_print=True)
+    print("Monitoring... Press Ctrl+C to stop.\n")
+
+    # State tracking
+    left_down = False
+    drag_start_ts = 0          # monotonic
+    drag_start_wall = None     # wall clock
+    last_release_ts = 0
+    drag_events = []           # Collect events during a drag
+    drag_anomalies = []        # Anomalies within current drag
+    drag_focus_at_start = ""
+    total_drags = 0
+    total_anomalies = 0
+    stats_interval = 300       # Print stats every 5 min
+    last_stats_ts = time.monotonic()
+
+    for event in device.read_loop():
+        now = time.monotonic()
+
+        # Periodic stats
+        if now - last_stats_ts > stats_interval:
+            log(f"STATS: drags={total_drags}, anomalies={total_anomalies}, "
+                f"focus_window={focus.current_window}", also_print=True)
+            last_stats_ts = now
+
+        # Only care about key/button events
+        if event.type != ecodes.EV_KEY:
+            continue
+
+        if event.code == BTN_LEFT:
+            if event.value == 1:  # Press
+                left_down = True
+                drag_start_ts = now
+                drag_start_wall = datetime.now()
+                drag_events = []
+                drag_anomalies = []
+                drag_focus_at_start = focus.current_window
+
+                # Check for bounce: very fast press after a release
+                if last_release_ts > 0:
+                    gap = (now - last_release_ts) * 1000
+                    if gap < args.threshold:
+                        msg = (f"BOUNCE: re-press {gap:.1f}ms after release "
+                               f"(threshold={args.threshold}ms) "
+                               f"focus={focus.current_window}")
+                        log(msg, also_print=True)
+                        total_anomalies += 1
+
+            elif event.value == 0:  # Release
+                last_release_ts = now
+
+                if left_down:
+                    left_down = False
+                    drag_duration_ms = (now - drag_start_ts) * 1000
+                    total_drags += 1
+
+                    # Collect context
+                    focus_changes = focus.focus_changes_since(drag_start_ts)
+                    bt_events = bt_monitor.events_since(drag_start_ts)
+
+                    is_anomaly = False
+
+                    # Short drag = likely bounce
+                    if drag_duration_ms < SHORT_DRAG_THRESHOLD_MS:
+                        is_anomaly = True
+                        drag_anomalies.append(
+                            f"SHORT_DRAG: {drag_duration_ms:.1f}ms")
+
+                    # Focus changed during drag (ignore click-to-focus at start)
+                    for fts, fwin in focus_changes:
+                        offset_ms = (fts - drag_start_ts) * 1000
+                        if offset_ms > FOCUS_GRACE_MS:
+                            is_anomaly = True
+                            drag_anomalies.append(
+                                f"FOCUS_CHANGE at +{offset_ms:.1f}ms: {fwin}")
+
+                    # BT adapter events during drag
+                    if bt_events:
+                        is_anomaly = True
+                        for evt in bt_events:
+                            offset = format_ms(drag_start_ts, evt[0])
+                            drag_anomalies.append(
+                                f"BT_EVENT at +{offset}: {evt[1:]}")
+
+                    if is_anomaly:
+                        total_anomalies += 1
+                        msg = (f"ANOMALY DRAG #{total_drags}: "
+                               f"duration={drag_duration_ms:.1f}ms, "
+                               f"started={drag_start_wall.strftime('%H:%M:%S.%f')[:-3]}, "
+                               f"focus_start={drag_focus_at_start}, "
+                               f"focus_end={focus.current_window}")
+                        log(msg, also_print=True)
+                        for a in drag_anomalies:
+                            log(f"  -> {a}", also_print=True)
+                    elif not args.quiet:
+                        # Normal drag - just log briefly
+                        if drag_duration_ms > 200:  # Skip trivial clicks
+                            log(f"DRAG #{total_drags}: "
+                                f"duration={drag_duration_ms:.1f}ms, "
+                                f"focus={drag_focus_at_start}")
+
+        # Track other button events during a drag (could indicate interference)
+        elif left_down and event.code in (BTN_RIGHT, BTN_MIDDLE):
+            btn_name = "RIGHT" if event.code == BTN_RIGHT else "MIDDLE"
+            action = "press" if event.value == 1 else "release"
+            offset = format_ms(drag_start_ts, now)
+            msg = f"OTHER_BUTTON during drag: {btn_name} {action} at +{offset}"
+            drag_anomalies.append(msg)
+            log(f"  mid-drag: {msg}", also_print=True)
+
+
+if __name__ == "__main__":
+    main()

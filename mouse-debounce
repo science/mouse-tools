@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""
+Universal mouse debounce filter.
+
+Intercepts raw evdev mouse events and suppresses phantom button releases
+shorter than a configurable threshold. This fixes hardware switch bounce
+(worn Omron micro-switches) that causes lost drags and phantom clicks.
+
+Creates a virtual mouse device via uinput that forwards all events except
+bounced releases. The original device is grabbed (exclusive access) so
+only the filtered events reach X11/Wayland.
+
+Applies to all detected mice unless --device is specified.
+
+Requires: root (for evdev grab + uinput creation)
+Usage: sudo mouse-debounce [--threshold 60]
+"""
+
+import argparse
+import os
+import select
+import signal
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+try:
+    import evdev
+    from evdev import UInput, ecodes
+except ImportError:
+    print("Error: python3-evdev required. Install: sudo apt install python3-evdev",
+          file=sys.stderr)
+    sys.exit(1)
+
+
+DEBOUNCE_MS = 60
+BUTTON_CODES = {ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE,
+                ecodes.BTN_SIDE, ecodes.BTN_EXTRA}
+
+_real_user = os.environ.get("SUDO_USER", os.environ.get("USER", "root"))
+_real_home = Path(f"/home/{_real_user}") if _real_user != "root" else Path.home()
+LOG_DIR = _real_home / ".local" / "share" / "mouse-debounce"
+LOG_FILE = LOG_DIR / "debounce.log"
+
+
+def log(msg, also_print=True):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    line = f"[{ts}] {msg}"
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    if also_print:
+        print(line, flush=True)
+
+
+def find_mice():
+    """Find all physical mouse evdev devices (skip virtual/forwarded)."""
+    mice = []
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+        except Exception:
+            continue
+        # Skip virtual devices (our own output, input-remapper, etc.)
+        if "uinput" in (dev.phys or "").lower() or "input-remapper" in dev.name.lower():
+            continue
+        caps = dev.capabilities()
+        key_caps = caps.get(ecodes.EV_KEY, [])
+        rel_caps = caps.get(ecodes.EV_REL, [])
+        # Must have BTN_LEFT and relative axes (mouse movement)
+        if ecodes.BTN_LEFT in key_caps and ecodes.REL_X in rel_caps:
+            mice.append(dev)
+    return mice
+
+
+class DebouncedMouse:
+    """Wraps a single mouse device with debounce filtering."""
+
+    def __init__(self, device, threshold_ms, quiet=False):
+        self.device = device
+        self.threshold_s = threshold_ms / 1000.0
+        self.quiet = quiet
+        self.name = device.name
+        # Per-button state: last release monotonic timestamp
+        self.last_release = {}
+        # Per-button state: is currently pressed
+        self.pressed = {}
+        self.suppressed = 0
+        self.total_clicks = 0
+
+        # Create virtual device cloning capabilities of the original
+        self.uinput = UInput.from_device(device, name=f"debounced {device.name}")
+
+        # Grab exclusive access to the original device
+        device.grab()
+
+    def process_event(self, event):
+        """Process one event. Returns True if forwarded, False if suppressed."""
+        # Non-button events: always forward immediately
+        if event.type != ecodes.EV_KEY or event.code not in BUTTON_CODES:
+            self.uinput.write_event(event)
+            return True
+
+        now = time.monotonic()
+        btn = event.code
+
+        if event.value == 1:  # Press
+            # Check if this press follows a suspiciously fast release (bounce)
+            last_rel = self.last_release.get(btn, 0)
+            if last_rel > 0 and self.pressed.get(btn, False) is False:
+                gap = now - last_rel
+                if gap < self.threshold_s:
+                    # This press is a bounce re-press. Suppress it, but also
+                    # retroactively "undo" the release we already forwarded
+                    # by sending a press now (restoring the held state).
+                    # Actually: the release was already sent. The best we can
+                    # do is send the press immediately to minimize the gap.
+                    # But the cleaner approach is to delay releases (see below).
+                    pass
+
+            self.pressed[btn] = True
+            self.total_clicks += 1
+            self.uinput.write_event(event)
+            return True
+
+        elif event.value == 0:  # Release
+            self.pressed[btn] = False
+            self.last_release[btn] = now
+            # Forward the release - we can't delay without adding latency
+            # to ALL releases. Instead, we handle it on the re-press side:
+            # if a press comes too fast after this release, we know the
+            # release was a bounce.
+            self.uinput.write_event(event)
+            return True
+
+        else:
+            # value == 2 (repeat) - just forward
+            self.uinput.write_event(event)
+            return True
+
+    def close(self):
+        try:
+            self.device.ungrab()
+        except Exception:
+            pass
+        try:
+            self.uinput.close()
+        except Exception:
+            pass
+
+
+class DelayedDebouncedMouse:
+    """
+    Debounce by delaying button releases.
+
+    When a release arrives, hold it for `threshold_ms` before forwarding.
+    If a press arrives during the hold period, suppress both the release
+    and re-press (the button was never really released). This adds slight
+    latency to genuine releases but completely masks bounce.
+
+    The added latency (60ms default) is imperceptible for normal use.
+    """
+
+    def __init__(self, device, threshold_ms, warn_threshold_ms=None, quiet=False):
+        self.device = device
+        self.threshold_s = threshold_ms / 1000.0
+        self.warn_threshold_s = (warn_threshold_ms or 100) / 1000.0
+        self.quiet = quiet
+        self.name = device.name
+        # Per-button: pending release event and its timestamp
+        self.pending_release = {}   # btn -> (event, monotonic_time)
+        # Per-button: last forwarded release - both original and forwarded times
+        self.last_forwarded_release = {}  # btn -> (original_ts, forwarded_ts)
+        self.suppressed = 0
+        self.total_clicks = 0
+
+        self.uinput = UInput.from_device(device, name=f"debounced {device.name}")
+        device.grab()
+
+    def process_event(self, event):
+        now = time.monotonic()
+
+        if event.type != ecodes.EV_KEY or event.code not in BUTTON_CODES:
+            self.uinput.write_event(event)
+            return True
+
+        btn = event.code
+
+        if event.value == 1:  # Press
+            self.total_clicks += 1
+            if btn in self.pending_release:
+                # A release was pending and a press came before threshold expired.
+                # This is bounce - suppress both the pending release and this press.
+                _, release_ts = self.pending_release[btn]
+                gap_ms = (now - release_ts) * 1000
+                del self.pending_release[btn]
+                self.suppressed += 1
+                btn_name = {272: "LEFT", 273: "RIGHT", 274: "MIDDLE",
+                            275: "SIDE", 276: "EXTRA"}.get(btn, str(btn))
+                log(f"SUPPRESSED bounce on {self.name}: {btn_name} "
+                    f"gap={gap_ms:.1f}ms (suppressed={self.suppressed} total)")
+                return False
+            else:
+                # Normal press - check for near-miss (above threshold but suspicious)
+                last_rel = self.last_forwarded_release.get(btn)
+                if last_rel is not None:
+                    orig_ts, fwd_ts = last_rel
+                    hardware_gap_ms = (now - orig_ts) * 1000
+                    if hardware_gap_ms < self.warn_threshold_s * 1000:
+                        thresh_ms = self.threshold_s * 1000
+                        btn_name = {272: "LEFT", 273: "RIGHT", 274: "MIDDLE",
+                                    275: "SIDE", 276: "EXTRA"}.get(btn, str(btn))
+                        log(f"NEAR-MISS on {self.name}: {btn_name} "
+                            f"hardware_gap={hardware_gap_ms:.1f}ms "
+                            f"(threshold={thresh_ms:.0f}ms, "
+                            f"escaped by {hardware_gap_ms - thresh_ms:.1f}ms)")
+                self.uinput.write_event(event)
+                return True
+
+        elif event.value == 0:  # Release
+            # Don't forward yet - hold it for the debounce window
+            self.pending_release[btn] = (event, now)
+            return True  # Queued, not yet forwarded
+
+        else:
+            self.uinput.write_event(event)
+            return True
+
+    def flush_pending(self):
+        """Flush any pending releases that have expired their debounce window."""
+        now = time.monotonic()
+        expired = []
+        for btn, (event, orig_ts) in self.pending_release.items():
+            if now - orig_ts >= self.threshold_s:
+                expired.append(btn)
+                self.uinput.write_event(event)
+                self.last_forwarded_release[btn] = (orig_ts, now)
+        for btn in expired:
+            del self.pending_release[btn]
+
+    def next_deadline(self):
+        """Return seconds until the next pending release should be flushed, or None."""
+        if not self.pending_release:
+            return None
+        now = time.monotonic()
+        earliest = min(ts for _, ts in self.pending_release.values())
+        remaining = self.threshold_s - (now - earliest)
+        return max(0, remaining)
+
+    def close(self):
+        # Flush any remaining pending releases
+        for btn, (event, ts) in self.pending_release.items():
+            self.uinput.write_event(event)
+        self.pending_release.clear()
+        try:
+            self.device.ungrab()
+        except Exception:
+            pass
+        try:
+            self.uinput.close()
+        except Exception:
+            pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Universal mouse debounce filter")
+    parser.add_argument("--threshold", type=int, default=DEBOUNCE_MS,
+                        help=f"Debounce threshold in ms (default: {DEBOUNCE_MS})")
+    parser.add_argument("--device", action="append",
+                        help="Specific evdev device(s) to filter (default: all mice)")
+    parser.add_argument("--warn-threshold", type=int, default=100,
+                        help="Log NEAR-MISS for release->press gaps between "
+                             "threshold and this value in ms (default: 100)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Suppress per-event logging")
+    parser.add_argument("--stats-interval", type=int, default=600,
+                        help="Print stats every N seconds (default: 600)")
+    args = parser.parse_args()
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.device:
+        devices = []
+        for path in args.device:
+            try:
+                devices.append(evdev.InputDevice(path))
+            except Exception as e:
+                log(f"Error opening {path}: {e}")
+                sys.exit(1)
+    else:
+        devices = find_mice()
+
+    if not devices:
+        log("No mouse devices found.")
+        sys.exit(1)
+
+    mice = []
+    for dev in devices:
+        try:
+            dm = DelayedDebouncedMouse(dev, args.threshold,
+                                       warn_threshold_ms=args.warn_threshold,
+                                       quiet=args.quiet)
+            mice.append(dm)
+            log(f"Filtering: {dev.name} ({dev.path}) -> {dm.uinput.name}")
+        except Exception as e:
+            log(f"Error setting up {dev.name}: {e}")
+
+    if not mice:
+        log("No devices could be set up.")
+        sys.exit(1)
+
+    log(f"Debounce active: threshold={args.threshold}ms, devices={len(mice)}")
+
+    running = True
+
+    def cleanup(sig=None, frame=None):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    # Build fd -> mouse mapping for select()
+    fd_map = {m.device.fd: m for m in mice}
+    last_stats = time.monotonic()
+
+    while running:
+        # Calculate select timeout: need to flush pending releases on time
+        timeout = None
+        for m in mice:
+            dl = m.next_deadline()
+            if dl is not None:
+                timeout = dl if timeout is None else min(timeout, dl)
+        if timeout is None:
+            timeout = 1.0  # Wake up periodically for stats
+
+        try:
+            readable, _, _ = select.select(list(fd_map.keys()), [], [], timeout)
+        except (KeyboardInterrupt, ValueError):
+            break
+
+        # Process readable devices
+        for fd in readable:
+            mouse = fd_map[fd]
+            try:
+                for event in mouse.device.read():
+                    mouse.process_event(event)
+            except OSError:
+                log(f"Device disconnected: {mouse.name}")
+                mouse.close()
+                del fd_map[fd]
+                mice.remove(mouse)
+
+        # Flush expired pending releases
+        for m in mice:
+            m.flush_pending()
+
+        # Periodic stats
+        now = time.monotonic()
+        if now - last_stats > args.stats_interval:
+            for m in mice:
+                log(f"STATS: {m.name}: clicks={m.total_clicks}, "
+                    f"suppressed={m.suppressed}")
+            last_stats = now
+
+    # Cleanup
+    for m in mice:
+        log(f"FINAL: {m.name}: clicks={m.total_clicks}, suppressed={m.suppressed}")
+        m.close()
+    log("Debounce filter stopped.")
+
+
+if __name__ == "__main__":
+    main()
