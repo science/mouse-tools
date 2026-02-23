@@ -233,13 +233,14 @@ class DelayedDebouncedMouse:
 
         if event.value == 1:  # Press
             self.total_clicks += 1
-            self.press_time[btn] = now
             if btn in self.pending_release:
                 _, release_ts, was_drag = self.pending_release[btn]
                 gap_ms = (now - release_ts) * 1000
 
                 if was_drag:
                     # Long hold followed by fast re-press = drag bounce → suppress
+                    # Don't update press_time — the button was never really released,
+                    # so the original press is still the active one.
                     hold_ms = (release_ts - self.press_time.get(btn, release_ts)) * 1000
                     del self.pending_release[btn]
                     self.suppressed += 1
@@ -257,9 +258,12 @@ class DelayedDebouncedMouse:
                     syn = evdev.InputEvent(0, 0, ecodes.EV_SYN, ecodes.SYN_REPORT, 0)
                     self.uinput.write_event(syn)
                     self.last_forwarded_release[btn] = (pending_ts, now, False)
+                    # New click starts now
+                    self.press_time[btn] = now
                     self.uinput.write_event(event)
                     return True
             else:
+                self.press_time[btn] = now
                 # Normal press - check for near-miss (only after drags, not clicks)
                 last_rel = self.last_forwarded_release.get(btn)
                 if last_rel is not None:
