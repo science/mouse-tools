@@ -182,8 +182,8 @@ class DelayedDebouncedMouse:
         self.pending_release = {}   # btn -> (event, monotonic_time, was_drag)
         # Per-button: when the button was pressed (for hold duration calc)
         self.press_time = {}        # btn -> monotonic_time
-        # Per-button: last forwarded release - both original and forwarded times
-        self.last_forwarded_release = {}  # btn -> (original_ts, forwarded_ts)
+        # Per-button: last forwarded release - timestamps and whether it was a drag
+        self.last_forwarded_release = {}  # btn -> (original_ts, forwarded_ts, was_drag)
         self.suppressed = 0
         self.total_clicks = 0
         # Latency tracking
@@ -240,12 +240,14 @@ class DelayedDebouncedMouse:
 
                 if was_drag:
                     # Long hold followed by fast re-press = drag bounce → suppress
+                    hold_ms = (release_ts - self.press_time.get(btn, release_ts)) * 1000
                     del self.pending_release[btn]
                     self.suppressed += 1
                     btn_name = {272: "LEFT", 273: "RIGHT", 274: "MIDDLE",
                                 275: "SIDE", 276: "EXTRA"}.get(btn, str(btn))
                     log(f"SUPPRESSED bounce on {self.name}: {btn_name} "
-                        f"gap={gap_ms:.1f}ms (suppressed={self.suppressed} total)")
+                        f"gap={gap_ms:.1f}ms hold={hold_ms:.0f}ms "
+                        f"(suppressed={self.suppressed} total)")
                     return False
                 else:
                     # Short hold followed by fast re-press = fast double-click → allow
@@ -254,23 +256,24 @@ class DelayedDebouncedMouse:
                     self.uinput.write_event(pending_event)
                     syn = evdev.InputEvent(0, 0, ecodes.EV_SYN, ecodes.SYN_REPORT, 0)
                     self.uinput.write_event(syn)
-                    self.last_forwarded_release[btn] = (pending_ts, now)
+                    self.last_forwarded_release[btn] = (pending_ts, now, False)
                     self.uinput.write_event(event)
                     return True
             else:
-                # Normal press - check for near-miss (above threshold but suspicious)
+                # Normal press - check for near-miss (only after drags, not clicks)
                 last_rel = self.last_forwarded_release.get(btn)
                 if last_rel is not None:
-                    orig_ts, fwd_ts = last_rel
-                    hardware_gap_ms = (now - orig_ts) * 1000
-                    if hardware_gap_ms < self.warn_threshold_s * 1000:
-                        thresh_ms = self.threshold_s * 1000
-                        btn_name = {272: "LEFT", 273: "RIGHT", 274: "MIDDLE",
-                                    275: "SIDE", 276: "EXTRA"}.get(btn, str(btn))
-                        log(f"NEAR-MISS on {self.name}: {btn_name} "
-                            f"hardware_gap={hardware_gap_ms:.1f}ms "
-                            f"(threshold={thresh_ms:.0f}ms, "
-                            f"escaped by {hardware_gap_ms - thresh_ms:.1f}ms)")
+                    orig_ts, fwd_ts, prev_was_drag = last_rel
+                    if prev_was_drag:
+                        hardware_gap_ms = (now - orig_ts) * 1000
+                        if hardware_gap_ms < self.warn_threshold_s * 1000:
+                            thresh_ms = self.threshold_s * 1000
+                            btn_name = {272: "LEFT", 273: "RIGHT", 274: "MIDDLE",
+                                        275: "SIDE", 276: "EXTRA"}.get(btn, str(btn))
+                            log(f"NEAR-MISS on {self.name}: {btn_name} "
+                                f"hardware_gap={hardware_gap_ms:.1f}ms "
+                                f"(threshold={thresh_ms:.0f}ms, "
+                                f"escaped by {hardware_gap_ms - thresh_ms:.1f}ms)")
                 self.uinput.write_event(event)
                 return True
 
@@ -296,11 +299,11 @@ class DelayedDebouncedMouse:
         """
         now = time.monotonic()
         expired = []
-        for btn, (event, orig_ts, _was_drag) in self.pending_release.items():
+        for btn, (event, orig_ts, was_drag) in self.pending_release.items():
             if now - orig_ts >= self.threshold_s:
                 expired.append(btn)
                 self.uinput.write_event(event)
-                self.last_forwarded_release[btn] = (orig_ts, now)
+                self.last_forwarded_release[btn] = (orig_ts, now, was_drag)
         for btn in expired:
             del self.pending_release[btn]
         if expired:
