@@ -392,7 +392,25 @@ def main():
         log("No devices could be set up.")
         sys.exit(1)
 
-    log(f"Debounce active: threshold={args.threshold}ms, devices={len(mice)}")
+    # Emit full configuration summary at startup
+    log(f"mouse-debounce started — {len(mice)} device(s)")
+    log(f"  Hold threshold:    {args.hold_threshold}ms  "
+        f"(holds < {args.hold_threshold}ms = click, >= {args.hold_threshold}ms = drag)")
+    log(f"  Debounce window:   {args.threshold}ms  "
+        f"(release held this long before forwarding)")
+    log(f"  Warn threshold:    {args.warn_threshold}ms  "
+        f"(NEAR-MISS logged for gaps {args.threshold}–{args.warn_threshold}ms)")
+    log(f"  Lag threshold:     {args.lag_threshold}ms  "
+        f"(LAG_SPIKE logged when processing > {args.lag_threshold}ms behind kernel)")
+    log(f"  Stats interval:    {args.stats_interval}s")
+    log(f"  Quiet mode:        {'on' if args.quiet else 'off'}")
+    log(f"  Log file:          {LOG_FILE}")
+    log(f"")
+    log(f"  Behavior summary:")
+    log(f"    Click then fast re-press (hold < {args.hold_threshold}ms):  ALLOWED through")
+    log(f"    Drag then fast re-press  (hold >= {args.hold_threshold}ms): SUPPRESSED if gap < {args.threshold}ms")
+    log(f"    All releases:            delayed {args.threshold}ms before forwarding")
+    log(f"    Buttons filtered:        LEFT, RIGHT, MIDDLE, SIDE, EXTRA")
 
     running = True
 
