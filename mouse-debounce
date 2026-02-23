@@ -20,6 +20,7 @@ import argparse
 import os
 import select
 import signal
+import struct
 import sys
 import time
 from datetime import datetime
@@ -164,24 +165,58 @@ class DelayedDebouncedMouse:
     The added latency (60ms default) is imperceptible for normal use.
     """
 
-    def __init__(self, device, threshold_ms, warn_threshold_ms=None, quiet=False):
+    def __init__(self, device, threshold_ms, warn_threshold_ms=None, quiet=False,
+                 lag_threshold_ms=10):
         self.device = device
         self.threshold_s = threshold_ms / 1000.0
         self.warn_threshold_s = (warn_threshold_ms or 100) / 1000.0
         self.quiet = quiet
         self.name = device.name
+        self.lag_threshold_ms = lag_threshold_ms
         # Per-button: pending release event and its timestamp
         self.pending_release = {}   # btn -> (event, monotonic_time)
         # Per-button: last forwarded release - both original and forwarded times
         self.last_forwarded_release = {}  # btn -> (original_ts, forwarded_ts)
         self.suppressed = 0
         self.total_clicks = 0
+        # Latency tracking
+        self.total_events = 0
+        self.lag_spikes = 0
+        self.max_lag_ms = 0.0
+        self._wall_offset = None  # Calibrated offset: wall_clock - kernel_timestamp
 
         self.uinput = UInput.from_device(device, name=f"debounced {device.name}")
         device.grab()
 
+    def _measure_lag(self, event):
+        """Measure lag between kernel event timestamp and our processing time."""
+        self.total_events += 1
+        # evdev events carry kernel timestamps (event.sec, event.usec)
+        try:
+            kernel_ts = event.sec + event.usec / 1_000_000.0
+        except (AttributeError, TypeError):
+            return
+        wall_now = time.time()
+        # Calibrate offset on first event
+        if self._wall_offset is None:
+            self._wall_offset = wall_now - kernel_ts
+            return
+        lag_ms = (wall_now - kernel_ts - self._wall_offset) * 1000
+        # Ignore negative lag (clock drift recalibration)
+        if lag_ms < 0:
+            self._wall_offset = wall_now - kernel_ts
+            return
+        if lag_ms > self.max_lag_ms:
+            self.max_lag_ms = lag_ms
+        if lag_ms > self.lag_threshold_ms:
+            self.lag_spikes += 1
+            log(f"LAG_SPIKE on {self.name}: {lag_ms:.1f}ms "
+                f"(event_type={event.type}, code={event.code}, "
+                f"spikes={self.lag_spikes}/{self.total_events})")
+
     def process_event(self, event):
         now = time.monotonic()
+        self._measure_lag(event)
 
         if event.type != ecodes.EV_KEY or event.code not in BUTTON_CODES:
             self.uinput.write_event(event)
@@ -230,7 +265,12 @@ class DelayedDebouncedMouse:
             return True
 
     def flush_pending(self):
-        """Flush any pending releases that have expired their debounce window."""
+        """Flush any pending releases that have expired their debounce window.
+
+        After flushing, writes a SYN_REPORT so the uinput consumer (X11)
+        sees the release immediately. Without this, flushed releases sit
+        in the uinput buffer until the next mouse movement event.
+        """
         now = time.monotonic()
         expired = []
         for btn, (event, orig_ts) in self.pending_release.items():
@@ -240,6 +280,9 @@ class DelayedDebouncedMouse:
                 self.last_forwarded_release[btn] = (orig_ts, now)
         for btn in expired:
             del self.pending_release[btn]
+        if expired:
+            syn = evdev.InputEvent(0, 0, ecodes.EV_SYN, ecodes.SYN_REPORT, 0)
+            self.uinput.write_event(syn)
 
     def next_deadline(self):
         """Return seconds until the next pending release should be flushed, or None."""
@@ -274,6 +317,9 @@ def main():
     parser.add_argument("--warn-threshold", type=int, default=100,
                         help="Log NEAR-MISS for release->press gaps between "
                              "threshold and this value in ms (default: 100)")
+    parser.add_argument("--lag-threshold", type=int, default=10,
+                        help="Log LAG_SPIKE when event processing lags more than "
+                             "this many ms behind the kernel timestamp (default: 10)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress per-event logging")
     parser.add_argument("--stats-interval", type=int, default=600,
@@ -302,7 +348,8 @@ def main():
         try:
             dm = DelayedDebouncedMouse(dev, args.threshold,
                                        warn_threshold_ms=args.warn_threshold,
-                                       quiet=args.quiet)
+                                       quiet=args.quiet,
+                                       lag_threshold_ms=args.lag_threshold)
             mice.append(dm)
             log(f"Filtering: {dev.name} ({dev.path}) -> {dm.uinput.name}")
         except Exception as e:
@@ -363,7 +410,9 @@ def main():
         if now - last_stats > args.stats_interval:
             for m in mice:
                 log(f"STATS: {m.name}: clicks={m.total_clicks}, "
-                    f"suppressed={m.suppressed}")
+                    f"suppressed={m.suppressed}, events={m.total_events}, "
+                    f"lag_spikes={m.lag_spikes}, max_lag={m.max_lag_ms:.1f}ms")
+                m.max_lag_ms = 0.0  # Reset per interval
             last_stats = now
 
     # Cleanup

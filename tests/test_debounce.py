@@ -30,11 +30,15 @@ def debounce_module():
 
 
 def make_event(type_code, code, value):
-    """Create a mock evdev event."""
+    """Create a mock evdev event with realistic kernel timestamps."""
     ev = MagicMock()
     ev.type = type_code
     ev.code = code
     ev.value = value
+    # Provide numeric sec/usec so _measure_lag doesn't choke on MagicMock arithmetic
+    now = time.time()
+    ev.sec = int(now)
+    ev.usec = int((now - int(now)) * 1_000_000)
     return ev
 
 
@@ -123,8 +127,9 @@ class TestDelayedDebouncedMouse:
         time.sleep(0.06)
         mouse.flush_pending()
 
-        # Now it should be forwarded
-        uinput.write_event.assert_called_once_with(release)
+        # Should be forwarded (release + SYN_REPORT)
+        calls = uinput.write_event.call_args_list
+        assert calls[0].args[0] == release
         assert ecodes.BTN_LEFT not in mouse.pending_release
 
     def test_bounce_suppressed(self, debounce_module):
@@ -243,6 +248,123 @@ class TestDelayedDebouncedMouse:
 
         assert result is True
         uinput.write_event.assert_called_once_with(ev)
+
+
+class TestFlushSynReport:
+    """Tests for SYN_REPORT after flushed releases.
+
+    uinput virtual devices batch events and only deliver them to consumers
+    on EV_SYN/SYN_REPORT. When we hold a button release and flush it later
+    (after the debounce threshold), the flushed release must be followed by
+    a SYN_REPORT. Otherwise the release sits in the uinput buffer until the
+    next mouse movement event, causing clicks to appear "stuck" when the
+    mouse is stationary.
+
+    Bug: click a button without moving the mouse → release never delivered
+    until mouse moves.
+    """
+
+    def _make_mouse(self, debounce_module, threshold_ms=50):
+        from evdev import ecodes
+
+        mock_device = MagicMock()
+        mock_device.name = "Test Mouse"
+        mock_device.fd = 99
+
+        mock_uinput = MagicMock()
+
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.from_device.return_value = mock_uinput
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, threshold_ms, quiet=True,
+            )
+
+        return mouse, mock_uinput
+
+    def test_flushed_release_followed_by_syn(self, debounce_module):
+        """A flushed pending release must be followed by SYN_REPORT.
+
+        Simulates: user clicks a button, doesn't move the mouse, waits
+        for threshold to expire. The flush must emit both the release
+        event AND a SYN_REPORT so uinput delivers it immediately.
+        """
+        from evdev import ecodes
+
+        mouse, uinput = self._make_mouse(debounce_module, threshold_ms=50)
+
+        # Click: press then release (no movement)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        uinput.write_event.reset_mock()
+
+        release = make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0)
+        mouse.process_event(release)
+
+        # Wait past threshold and flush
+        time.sleep(0.06)
+        mouse.flush_pending()
+
+        # Should have TWO write_event calls: the release + SYN_REPORT
+        calls = uinput.write_event.call_args_list
+        assert len(calls) >= 2, (
+            f"Expected release + SYN_REPORT, got {len(calls)} calls: {calls}"
+        )
+
+        # First call: the release event
+        assert calls[0].args[0] == release
+
+        # Second call: must be a SYN_REPORT
+        syn_event = calls[1].args[0]
+        assert syn_event.type == ecodes.EV_SYN
+        assert syn_event.code == ecodes.SYN_REPORT
+        assert syn_event.value == 0
+
+    def test_suppressed_bounce_no_syn(self, debounce_module):
+        """When bounce is suppressed, no SYN_REPORT should be emitted.
+
+        If a release is pending and a re-press arrives (bounce), both are
+        suppressed. No events should be written, including no SYN_REPORT.
+        """
+        from evdev import ecodes
+
+        mouse, uinput = self._make_mouse(debounce_module, threshold_ms=60)
+
+        # Press
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        uinput.write_event.reset_mock()
+
+        # Release (pending)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+
+        # Bounce re-press before threshold
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+
+        # Nothing should have been forwarded
+        uinput.write_event.assert_not_called()
+
+    def test_multiple_buttons_flushed_get_single_syn(self, debounce_module):
+        """If multiple button releases flush at the same time, one SYN_REPORT
+        after all of them is sufficient (but one per release is also acceptable)."""
+        from evdev import ecodes
+
+        mouse, uinput = self._make_mouse(debounce_module, threshold_ms=50)
+
+        # Press and release two buttons
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_RIGHT, 1))
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_RIGHT, 0))
+        uinput.write_event.reset_mock()
+
+        time.sleep(0.06)
+        mouse.flush_pending()
+
+        calls = uinput.write_event.call_args_list
+        # Must have at least one SYN_REPORT
+        syn_calls = [c for c in calls if c.args[0].type == ecodes.EV_SYN]
+        assert len(syn_calls) >= 1, (
+            f"Expected at least one SYN_REPORT after flushing releases, "
+            f"got calls: {calls}"
+        )
 
 
 class TestFindMice:
