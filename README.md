@@ -1,6 +1,9 @@
-# mouse-debounce
+# mouse-tools
 
-Universal mouse button debounce filter for Linux. Fixes hardware switch bounce on worn Logitech (and other) mice that causes phantom button releases during drags and false double-clicks.
+Mouse management utilities for Linux, built on evdev.
+
+- **Button debounce** — Fixes hardware switch bounce on worn Logitech (and other) mice that causes phantom button releases during drags and false double-clicks.
+- **Button remapping** — Remaps mouse buttons to keyboard keys (e.g., forward/back to volume up/down). A lightweight replacement for input-remapper when all you need is simple button remaps.
 
 ## The Problem
 
@@ -44,21 +47,32 @@ sudo ./install.sh --uninstall
 
 ```bash
 # Run with default 60ms threshold
-sudo mouse-debounce
+sudo mouse-filter
 
 # Quiet mode (only log suppressions to file)
-sudo mouse-debounce --quiet
+sudo mouse-filter --quiet
 
 # Custom threshold and near-miss warning window
-sudo mouse-debounce --threshold 80 --warn-threshold 120
+sudo mouse-filter --threshold 80 --warn-threshold 120
 
 # Filter specific device(s) only
-sudo mouse-debounce --device /dev/input/event23
+sudo mouse-filter --device /dev/input/event23
 ```
+
+## Button Remapping
+
+Remap mouse buttons to keyboard keys using `--remap`:
+
+```bash
+# Remap forward/back to volume up/down, middle-click to mute
+sudo mouse-filter --remap BTN_EXTRA=KEY_VOLUMEUP --remap BTN_SIDE=KEY_VOLUMEDOWN --remap BTN_MIDDLE=KEY_MUTE
+```
+
+Remapped buttons are forwarded immediately (not debounced), since volume/mute buttons don't suffer from switch bounce. This replaces input-remapper for simple mouse button remapping with zero additional overhead — the events are already flowing through the debounce filter.
 
 ## Logging
 
-Events are logged to `~/.local/share/mouse-debounce/debounce.log` (uses `$SUDO_USER` home, not root).
+Events are logged to `~/.local/share/mouse-filter/debounce.log` (uses `$SUDO_USER` home, not root).
 
 | Event | Meaning |
 |-------|---------|

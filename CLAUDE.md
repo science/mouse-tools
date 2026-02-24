@@ -1,14 +1,16 @@
-# Mouse Debounce Project
+# Mouse Tools Project
 
 ## What This Is
 
-A universal mouse button debounce filter for Linux. Fixes hardware switch bounce (worn Omron micro-switches in Logitech and other mice) that causes phantom button releases during drags and false double-clicks.
+A collection of mouse management utilities for Linux, built on evdev. Currently provides:
+- **Button debounce** — Fixes hardware switch bounce (worn Omron micro-switches) that causes phantom releases during drags and false double-clicks.
+- **Button remapping** — Remaps mouse buttons to keyboard keys (e.g., forward/back → volume up/down). Replaces input-remapper for simple mouse button remaps.
 
 ## Architecture
 
-Two tools:
+Tools:
 
-- **`mouse-debounce`** — The main filter. Grabs raw evdev mouse devices, holds button releases for a configurable threshold, suppresses bounce (release→re-press pairs within the window). Creates virtual `debounced <name>` devices via uinput. Intended to run as a system service.
+- **`mouse-filter`** — The main filter. Grabs raw evdev mouse devices, remaps configured buttons, holds button releases for a configurable threshold, suppresses bounce (release→re-press pairs within the window). Creates virtual `debounced <name>` devices via uinput. Intended to run as a system service.
 - **`mouse-drag-monitor`** — Diagnostic tool. Monitors raw evdev + X11 focus + BT adapter power state to identify the source of phantom releases. Used during investigation, not in production.
 
 ### Debounce Strategy (Delayed Release)
@@ -24,9 +26,13 @@ Button releases are held for `threshold` ms. If a re-press arrives during the ho
 ### Event Pipeline
 
 ```
-Physical mouse → /dev/input/eventN → mouse-debounce (grabs device)
-    → uinput virtual device ("debounced <name>") → X11/Wayland
+Physical mouse → /dev/input/eventN → mouse-filter (grabs device)
+    → remap buttons → debounce filter → uinput virtual device → X11/Wayland
 ```
+
+### Button Remapping
+
+Remapping happens before debounce. Remapped buttons are forwarded with the new code and are NOT debounced (volume/mute buttons don't have bounce issues). Configure via `--remap` CLI flag or the `BUTTON_REMAP` dict in the source.
 
 ## Development Rules
 
@@ -40,7 +46,7 @@ Physical mouse → /dev/input/eventN → mouse-debounce (grabs device)
 
 | File | Purpose |
 |------|---------|
-| `mouse-debounce` | Main debounce filter (runs as service) |
+| `mouse-filter` | Main filter: debounce + button remapping (runs as service) |
 | `mouse-drag-monitor` | Diagnostic/telemetry tool |
 | `tests/` | Test suite |
 | `CLAUDE.md` | This file — project rules for AI |
@@ -62,6 +68,8 @@ Unit tests should test `DelayedDebouncedMouse` logic by mocking evdev devices:
 - Verify NEAR-MISS detection
 - Verify multi-button independence
 - Verify non-button events pass through unchanged
+- Verify button remapping transforms codes correctly
+- Verify remapped buttons are NOT debounced (forwarded immediately)
 
 ## Common Tasks
 
@@ -73,12 +81,12 @@ Add the `ecodes.BTN_*` constant to `BUTTON_CODES` set.
 
 ### Deploy to ~/.local/bin
 ```bash
-cp mouse-debounce ~/.local/bin/mouse-debounce
+cp mouse-filter ~/.local/bin/mouse-filter
 ```
 
 ### Run manually
 ```bash
-sudo ./mouse-debounce              # verbose
-sudo ./mouse-debounce --quiet      # production mode
-sudo ./mouse-debounce --threshold 80 --warn-threshold 120
+sudo ./mouse-filter              # verbose
+sudo ./mouse-filter --quiet      # production mode
+sudo ./mouse-filter --threshold 80 --warn-threshold 120
 ```

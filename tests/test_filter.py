@@ -1,4 +1,4 @@
-"""Tests for mouse-debounce filter logic.
+"""Tests for mouse-filter filter logic.
 
 Uses mock evdev devices to test the DelayedDebouncedMouse debounce logic
 without requiring root access or real hardware.
@@ -10,20 +10,20 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-# We need to import from the mouse-debounce script which has a hyphenated name
+# We need to import from the mouse-filter script which has a hyphenated name
 # and no .py extension. Use importlib.
 import importlib.util
 import importlib.machinery
 from pathlib import Path
 
-SCRIPT_PATH = Path(__file__).parent.parent / "mouse-debounce"
+SCRIPT_PATH = Path(__file__).parent.parent / "mouse-filter"
 
 
 @pytest.fixture
 def debounce_module():
-    """Import the mouse-debounce script as a module."""
-    loader = importlib.machinery.SourceFileLoader("mouse_debounce", str(SCRIPT_PATH))
-    spec = importlib.util.spec_from_loader("mouse_debounce", loader)
+    """Import the mouse-filter script as a module."""
+    loader = importlib.machinery.SourceFileLoader("mouse_filter", str(SCRIPT_PATH))
+    spec = importlib.util.spec_from_loader("mouse_filter", loader)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -495,6 +495,129 @@ class TestFlushSynReport:
             f"Expected at least one SYN_REPORT after flushing releases, "
             f"got calls: {calls}"
         )
+
+
+class TestButtonRemapping:
+    """Tests for button remapping (e.g., forward/back → volume up/down)."""
+
+    def _make_mouse(self, debounce_module, threshold_ms=60, remap=None):
+        from evdev import ecodes
+
+        mock_device = MagicMock()
+        mock_device.name = "Test Mouse"
+        mock_device.fd = 99
+        mock_uinput = MagicMock()
+
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.from_device.return_value = mock_uinput
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, threshold_ms, quiet=True,
+                button_remap=remap,
+            )
+        return mouse, mock_uinput
+
+    def test_remapped_button_press_uses_new_code(self, debounce_module):
+        """A remapped button press should be forwarded with the new key code."""
+        from evdev import ecodes
+
+        remap = {ecodes.BTN_EXTRA: ecodes.KEY_VOLUMEUP}
+        mouse, uinput = self._make_mouse(debounce_module, remap=remap)
+
+        ev = make_event(ecodes.EV_KEY, ecodes.BTN_EXTRA, 1)
+        result = mouse.process_event(ev)
+
+        assert result is True
+        written = uinput.write_event.call_args_list[-1].args[0]
+        assert written.code == ecodes.KEY_VOLUMEUP
+        assert written.value == 1
+
+    def test_remapped_button_release_uses_new_code(self, debounce_module):
+        """A remapped button release should be forwarded with the new key code."""
+        from evdev import ecodes
+
+        remap = {ecodes.BTN_EXTRA: ecodes.KEY_VOLUMEUP}
+        mouse, uinput = self._make_mouse(debounce_module, remap=remap)
+
+        # Press then release
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_EXTRA, 1))
+        uinput.write_event.reset_mock()
+
+        ev = make_event(ecodes.EV_KEY, ecodes.BTN_EXTRA, 0)
+        result = mouse.process_event(ev)
+
+        assert result is True
+        written = uinput.write_event.call_args_list[-1].args[0]
+        assert written.code == ecodes.KEY_VOLUMEUP
+        assert written.value == 0
+
+    def test_remapped_button_not_debounced(self, debounce_module):
+        """Remapped buttons should be forwarded immediately, not debounced."""
+        from evdev import ecodes
+
+        remap = {ecodes.BTN_EXTRA: ecodes.KEY_VOLUMEUP}
+        mouse, uinput = self._make_mouse(debounce_module, remap=remap)
+
+        # Press
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_EXTRA, 1))
+        uinput.write_event.reset_mock()
+
+        # Release — should be forwarded immediately, NOT queued
+        ev = make_event(ecodes.EV_KEY, ecodes.BTN_EXTRA, 0)
+        mouse.process_event(ev)
+
+        uinput.write_event.assert_called_once()
+        assert ecodes.BTN_EXTRA not in mouse.pending_release
+
+    def test_non_remapped_buttons_still_debounced(self, debounce_module):
+        """Buttons not in the remap dict should still go through debounce."""
+        from evdev import ecodes
+
+        remap = {ecodes.BTN_EXTRA: ecodes.KEY_VOLUMEUP}
+        mouse, uinput = self._make_mouse(debounce_module, remap=remap)
+
+        # BTN_LEFT is not remapped — should be debounced as normal
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        uinput.write_event.reset_mock()
+
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+
+        # Release should be pending (debounced), not forwarded
+        uinput.write_event.assert_not_called()
+        assert ecodes.BTN_LEFT in mouse.pending_release
+
+    def test_multiple_remaps(self, debounce_module):
+        """Multiple buttons can be remapped simultaneously."""
+        from evdev import ecodes
+
+        remap = {
+            ecodes.BTN_EXTRA: ecodes.KEY_VOLUMEUP,
+            ecodes.BTN_SIDE: ecodes.KEY_VOLUMEDOWN,
+            ecodes.BTN_MIDDLE: ecodes.KEY_MUTE,
+        }
+        mouse, uinput = self._make_mouse(debounce_module, remap=remap)
+
+        # Test each remapped button
+        for src, dst in remap.items():
+            uinput.write_event.reset_mock()
+            ev = make_event(ecodes.EV_KEY, src, 1)
+            mouse.process_event(ev)
+            written = uinput.write_event.call_args_list[-1].args[0]
+            assert written.code == dst, f"Expected {dst} for {src}, got {written.code}"
+
+    def test_no_remap_default(self, debounce_module):
+        """With no remap configured, all buttons go through normal debounce."""
+        from evdev import ecodes
+
+        mouse, uinput = self._make_mouse(debounce_module, remap=None)
+
+        # BTN_EXTRA should be debounced normally (no remap)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_EXTRA, 1))
+        uinput.write_event.reset_mock()
+
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_EXTRA, 0))
+
+        # Should be pending (debounced)
+        assert ecodes.BTN_EXTRA in mouse.pending_release
 
 
 class TestFindMice:

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INSTALL_BIN="/usr/local/bin/mouse-debounce"
+INSTALL_BIN="/usr/local/bin/mouse-filter"
 INSTALL_MONITOR="/usr/local/bin/mouse-drag-monitor"
-SERVICE_FILE="/etc/systemd/system/mouse-debounce.service"
-LOGROTATE_FILE="/etc/logrotate.d/mouse-debounce"
-LOG_DIR="/var/log/mouse-debounce"
+SERVICE_FILE="/etc/systemd/system/mouse-filter.service"
+LOGROTATE_FILE="/etc/logrotate.d/mouse-filter"
+LOG_DIR="/var/log/mouse-filter"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
@@ -34,10 +34,10 @@ do_install() {
     check_root
     check_deps
 
-    echo "Installing mouse-debounce..."
+    echo "Installing mouse-filter..."
 
     # Install binaries
-    cp "$SCRIPT_DIR/mouse-debounce" "$INSTALL_BIN"
+    cp "$SCRIPT_DIR/mouse-filter" "$INSTALL_BIN"
     chmod 755 "$INSTALL_BIN"
     echo "  Installed $INSTALL_BIN"
 
@@ -53,7 +53,7 @@ do_install() {
 
     # Install logrotate config
     cat > "$LOGROTATE_FILE" <<'LOGROTATE'
-/var/log/mouse-debounce/debounce.log {
+/var/log/mouse-filter/debounce.log {
     weekly
     rotate 4
     compress
@@ -69,7 +69,7 @@ LOGROTATE
     # Install systemd service
     cat > "$SERVICE_FILE" <<UNIT
 [Unit]
-Description=Mouse button debounce filter (fixes hardware switch bounce)
+Description=Mouse tools: debounce filter + button remapping
 After=multi-user.target
 
 [Service]
@@ -94,29 +94,29 @@ UNIT
     echo "  Installed $SERVICE_FILE"
 
     systemctl daemon-reload
-    systemctl enable mouse-debounce.service
-    systemctl start mouse-debounce.service
+    systemctl enable mouse-filter.service
+    systemctl start mouse-filter.service
     echo "  Service enabled and started"
 
     echo ""
     echo "Done."
-    echo "  Status:  systemctl status mouse-debounce.service"
-    echo "  Logs:    journalctl -u mouse-debounce.service -f"
+    echo "  Status:  systemctl status mouse-filter.service"
+    echo "  Logs:    journalctl -u mouse-filter.service -f"
     echo "  Logfile: $LOG_DIR/debounce.log"
 }
 
 do_uninstall() {
     check_root
 
-    echo "Uninstalling mouse-debounce..."
+    echo "Uninstalling mouse-filter..."
 
-    if systemctl is-active --quiet mouse-debounce.service 2>/dev/null; then
-        systemctl stop mouse-debounce.service
+    if systemctl is-active --quiet mouse-filter.service 2>/dev/null; then
+        systemctl stop mouse-filter.service
         echo "  Stopped service"
     fi
 
-    if systemctl is-enabled --quiet mouse-debounce.service 2>/dev/null; then
-        systemctl disable mouse-debounce.service
+    if systemctl is-enabled --quiet mouse-filter.service 2>/dev/null; then
+        systemctl disable mouse-filter.service
         echo "  Disabled service"
     fi
 

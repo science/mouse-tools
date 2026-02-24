@@ -13,7 +13,7 @@ only the filtered events reach X11/Wayland.
 Applies to all detected mice unless --device is specified.
 
 Requires: root (for evdev grab + uinput creation)
-Usage: sudo mouse-debounce [--threshold 60]
+Usage: sudo mouse-filter [--threshold 60]
 """
 
 import argparse
@@ -43,7 +43,7 @@ BUTTON_CODES = {ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE,
 _real_user = os.environ.get("SUDO_USER", os.environ.get("USER", "root"))
 _real_home = Path(f"/home/{_real_user}") if _real_user != "root" else Path.home()
 # Default log dir; overridable via --log-dir
-LOG_DIR = _real_home / ".local" / "share" / "mouse-debounce"
+LOG_DIR = _real_home / ".local" / "share" / "mouse-filter"
 LOG_FILE = None  # Set in main() after arg parsing
 
 
@@ -172,9 +172,11 @@ class DelayedDebouncedMouse:
     """
 
     def __init__(self, device, threshold_ms, warn_threshold_ms=None,
-                 hold_threshold_ms=None, quiet=False, lag_threshold_ms=10):
+                 hold_threshold_ms=None, quiet=False, lag_threshold_ms=10,
+                 button_remap=None):
         self.device = device
         self.threshold_s = threshold_ms / 1000.0
+        self.button_remap = button_remap or {}  # {src_code: dst_code}
         self.warn_threshold_s = (warn_threshold_ms or 100) / 1000.0
         self.hold_threshold_s = (hold_threshold_ms if hold_threshold_ms is not None
                                  else HOLD_THRESHOLD_MS) / 1000.0
@@ -227,6 +229,13 @@ class DelayedDebouncedMouse:
     def process_event(self, event):
         now = time.monotonic()
         self._measure_lag(event)
+
+        # Button remapping: transform code and forward immediately (no debounce)
+        if event.type == ecodes.EV_KEY and event.code in self.button_remap:
+            remapped = evdev.InputEvent(event.sec, event.usec, event.type,
+                                        self.button_remap[event.code], event.value)
+            self.uinput.write_event(remapped)
+            return True
 
         if event.type != ecodes.EV_KEY or event.code not in BUTTON_CODES:
             self.uinput.write_event(event)
@@ -361,8 +370,25 @@ def main():
     parser.add_argument("--stats-interval", type=int, default=600,
                         help="Print stats every N seconds (default: 600)")
     parser.add_argument("--log-dir", type=str, default=None,
-                        help="Directory for log files (default: ~/.local/share/mouse-debounce)")
+                        help="Directory for log files (default: ~/.local/share/mouse-filter)")
+    parser.add_argument("--remap", action="append", metavar="SRC=DST",
+                        help="Remap a button to a key, e.g. BTN_EXTRA=KEY_VOLUMEUP. "
+                             "Remapped buttons bypass debounce. Can be specified multiple times.")
     args = parser.parse_args()
+
+    # Parse button remaps
+    button_remap = {}
+    if args.remap:
+        for spec in args.remap:
+            try:
+                src_name, dst_name = spec.split("=", 1)
+                src_code = getattr(ecodes, src_name.strip())
+                dst_code = getattr(ecodes, dst_name.strip())
+                button_remap[src_code] = dst_code
+            except (ValueError, AttributeError) as e:
+                log(f"Invalid --remap '{spec}': {e}")
+                log(f"  Format: --remap BTN_EXTRA=KEY_VOLUMEUP")
+                sys.exit(1)
 
     global LOG_DIR, LOG_FILE
     if args.log_dir:
@@ -392,7 +418,8 @@ def main():
                                        warn_threshold_ms=args.warn_threshold,
                                        hold_threshold_ms=args.hold_threshold,
                                        quiet=args.quiet,
-                                       lag_threshold_ms=args.lag_threshold)
+                                       lag_threshold_ms=args.lag_threshold,
+                                       button_remap=button_remap)
             mice.append(dm)
             log(f"Filtering: {dev.name} ({dev.path}) -> {dm.uinput.name}")
         except Exception as e:
@@ -403,7 +430,7 @@ def main():
         sys.exit(1)
 
     # Emit full configuration summary at startup
-    log(f"mouse-debounce started — {len(mice)} device(s)")
+    log(f"mouse-filter started — {len(mice)} device(s)")
     log(f"  Hold threshold:    {args.hold_threshold}ms  "
         f"(holds < {args.hold_threshold}ms = click, >= {args.hold_threshold}ms = drag)")
     log(f"  Debounce window:   {args.threshold}ms  "
@@ -421,6 +448,11 @@ def main():
     log(f"    Drag then fast re-press  (hold >= {args.hold_threshold}ms): SUPPRESSED if gap < {args.threshold}ms")
     log(f"    All releases:            delayed {args.threshold}ms before forwarding")
     log(f"    Buttons filtered:        LEFT, RIGHT, MIDDLE, SIDE, EXTRA")
+    if button_remap:
+        for src, dst in button_remap.items():
+            src_name = ecodes.BTN.get(src, ecodes.KEY.get(src, str(src)))
+            dst_name = ecodes.KEY.get(dst, ecodes.BTN.get(dst, str(dst)))
+            log(f"    Remap:                   {src_name} ({src}) -> {dst_name} ({dst})")
 
     running = True
 
