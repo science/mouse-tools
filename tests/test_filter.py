@@ -787,6 +787,342 @@ class TestDeviceReconnection:
         new_uinput.write_event.assert_called_with(ev)
 
 
+class TestMoveDiagnostics:
+    """Tests for MoveDiagnostics — per-interval movement pipeline telemetry."""
+
+    def _make_diag(self, debounce_module, lag_threshold_ms=10):
+        return debounce_module.MoveDiagnostics(lag_threshold_ms=lag_threshold_ms)
+
+    def _make_mouse_with_diag(self, debounce_module, threshold_ms=60):
+        """Create a DelayedDebouncedMouse with diagnose_move=True."""
+        from evdev import ecodes
+
+        mock_device = MagicMock()
+        mock_device.name = "Test Mouse"
+        mock_device.fd = 99
+        mock_uinput = MagicMock()
+
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.from_device.return_value = mock_uinput
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, threshold_ms, quiet=True,
+                diagnose_move=True,
+            )
+        return mouse, mock_uinput
+
+    def test_move_diag_created_when_enabled(self, debounce_module):
+        """DelayedDebouncedMouse(diagnose_move=True) should create a MoveDiagnostics."""
+        mouse, _ = self._make_mouse_with_diag(debounce_module)
+        assert isinstance(mouse._move_diag, debounce_module.MoveDiagnostics)
+
+    def test_move_diag_not_created_by_default(self, debounce_module):
+        """Default construction should have _move_diag is None."""
+        from evdev import ecodes
+
+        mock_device = MagicMock()
+        mock_device.name = "Test Mouse"
+        mock_device.fd = 99
+        mock_uinput = MagicMock()
+
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.from_device.return_value = mock_uinput
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, 60, quiet=True,
+            )
+        assert mouse._move_diag is None
+
+    def test_record_input_counts_movements(self, debounce_module):
+        """record_input() should increment move_count."""
+        diag = self._make_diag(debounce_module)
+        for _ in range(5):
+            diag.record_input(1.0)
+        assert diag.move_count == 5
+
+    def test_record_input_tracks_max_lag(self, debounce_module):
+        """record_input() should track the maximum lag value."""
+        diag = self._make_diag(debounce_module)
+        for lag in [5.0, 12.0, 3.0]:
+            diag.record_input(lag)
+        assert diag.move_max_lag_ms == 12.0
+
+    def test_record_input_counts_lag_spikes(self, debounce_module):
+        """record_input() should count values exceeding lag threshold."""
+        diag = self._make_diag(debounce_module, lag_threshold_ms=10)
+        for lag in [5, 15, 8, 20]:
+            diag.record_input(lag)
+        assert diag.move_lag_spikes == 2
+
+    def test_hz_calculation(self, debounce_module):
+        """hz() should return approximate event rate."""
+        diag = self._make_diag(debounce_module)
+        # Simulate 100 events over ~0.1s
+        diag._interval_start = time.monotonic() - 0.1
+        diag.move_count = 100
+        hz = diag.hz()
+        assert 900 < hz < 1100  # ~1000 Hz with timing tolerance
+
+    def test_record_batch_tracking(self, debounce_module):
+        """record_batch() should track max batch size and total batches."""
+        diag = self._make_diag(debounce_module)
+        diag.record_batch(1)
+        diag.record_batch(5)
+        diag.record_batch(3)
+        assert diag.max_batch_size == 5
+        assert diag.total_batches == 3
+
+    def test_large_batch_detection(self, debounce_module):
+        """record_batch() should count batches exceeding threshold."""
+        diag = self._make_diag(debounce_module)
+        diag.record_batch(15)
+        assert diag.large_batch_count == 1
+
+    def test_record_loop_time(self, debounce_module):
+        """record_loop_time() should track max and count stalls."""
+        diag = self._make_diag(debounce_module)
+        diag.record_loop_time(0.5)
+        diag.record_loop_time(3.0)
+        diag.record_loop_time(1.0)
+        assert diag.loop_max_ms == 3.0
+        assert diag.loop_stall_count == 1  # 3.0ms > 2ms threshold
+
+    def test_record_write(self, debounce_module):
+        """record_write() should track write count and slow writes."""
+        diag = self._make_diag(debounce_module)
+        diag.record_write(0.0001)  # 0.1ms — fast
+        diag.record_write(0.001)   # 1.0ms — slow (>0.5ms)
+        assert diag.write_count == 2
+        assert diag.write_slow_count == 1
+        assert diag.write_max_s == 0.001
+
+    def test_verdict_clean(self, debounce_module):
+        """Fresh instance with no issues should report CLEAN."""
+        diag = self._make_diag(debounce_module)
+        assert diag.verdict() == "CLEAN"
+
+    def test_verdict_input_lag(self, debounce_module):
+        """Lag spikes should produce INPUT_LAG verdict."""
+        diag = self._make_diag(debounce_module)
+        diag.move_lag_spikes = 1
+        assert diag.verdict() == "INPUT_LAG"
+
+    def test_verdict_priority(self, debounce_module):
+        """INPUT_LAG should take priority over LOOP_STALL."""
+        diag = self._make_diag(debounce_module)
+        diag.move_lag_spikes = 1
+        diag.loop_stall_count = 1
+        assert diag.verdict() == "INPUT_LAG"
+
+    def test_verdict_loop_stall(self, debounce_module):
+        """Loop stalls without input lag should produce LOOP_STALL."""
+        diag = self._make_diag(debounce_module)
+        diag.loop_stall_count = 1
+        assert diag.verdict() == "LOOP_STALL"
+
+    def test_verdict_write_lag(self, debounce_module):
+        """Slow writes should produce WRITE_LAG verdict."""
+        diag = self._make_diag(debounce_module)
+        diag.write_slow_count = 1
+        assert diag.verdict() == "WRITE_LAG"
+
+    def test_verdict_x11_stall(self, debounce_module):
+        """X11 stalls should produce X11_STALL verdict."""
+        diag = self._make_diag(debounce_module)
+        diag.x11_stalls = 1
+        assert diag.verdict() == "X11_STALL"
+
+    def test_report_format(self, debounce_module):
+        """report() should contain expected fields."""
+        diag = self._make_diag(debounce_module)
+        diag.record_input(0.8)
+        report = diag.report()
+        assert "MOVE_DIAG:" in report
+        assert "rate=" in report
+        assert "input(" in report
+        assert "-> " in report
+
+    def test_reset_clears_interval_counters(self, debounce_module):
+        """reset() should zero interval counters but preserve _move_forwarded_count."""
+        diag = self._make_diag(debounce_module)
+        diag.record_input(5.0)
+        diag.record_input(15.0)
+        diag.record_batch(3)
+        diag.record_loop_time(3.0)
+        diag.record_write(0.001)
+        diag._move_forwarded_count = 42
+
+        diag.reset()
+
+        assert diag.move_count == 0
+        assert diag.move_max_lag_ms == 0.0
+        assert diag.move_lag_spikes == 0
+        assert diag.max_batch_size == 0
+        assert diag.total_batches == 0
+        assert diag.large_batch_count == 0
+        assert diag.loop_max_ms == 0.0
+        assert diag.loop_stall_count == 0
+        assert diag.write_count == 0
+        assert diag.write_slow_count == 0
+        assert diag.write_max_s == 0.0
+        assert diag.x11_stalls == 0
+        # _move_forwarded_count must be preserved (X11 probe needs it monotonically increasing)
+        assert diag._move_forwarded_count == 42
+
+
+class TestMoveDiagIntegration:
+    """Tests for MoveDiagnostics hooks in DelayedDebouncedMouse."""
+
+    def _make_mouse(self, debounce_module, threshold_ms=60, diagnose_move=True):
+        from evdev import ecodes
+
+        mock_device = MagicMock()
+        mock_device.name = "Test Mouse"
+        mock_device.fd = 99
+        mock_uinput = MagicMock()
+
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.from_device.return_value = mock_uinput
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, threshold_ms, quiet=True,
+                diagnose_move=diagnose_move,
+            )
+        return mouse, mock_uinput
+
+    def test_movement_event_recorded_in_diag(self, debounce_module):
+        """EV_REL events should be recorded in move diagnostics."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module)
+        ev = make_event(ecodes.EV_REL, ecodes.REL_X, 5)
+        mouse.process_event(ev)
+
+        assert mouse._move_diag.move_count == 1
+
+    def test_button_event_not_recorded_in_diag(self, debounce_module):
+        """EV_KEY events should NOT be recorded in move diagnostics."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module)
+        ev = make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1)
+        mouse.process_event(ev)
+
+        assert mouse._move_diag.move_count == 0
+
+    def test_write_timing_recorded_for_movement(self, debounce_module):
+        """Movement event writes should be timed in diagnostics."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module)
+        ev = make_event(ecodes.EV_REL, ecodes.REL_X, 5)
+        mouse.process_event(ev)
+
+        assert mouse._move_diag.write_count == 1
+
+    def test_write_timing_not_recorded_for_buttons(self, debounce_module):
+        """Button event writes should NOT be timed in diagnostics."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module)
+        ev = make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1)
+        mouse.process_event(ev)
+
+        assert mouse._move_diag.write_count == 0
+
+    def test_movement_passthrough_unchanged_with_diag(self, debounce_module):
+        """Movement events should still be forwarded correctly with diag active."""
+        from evdev import ecodes
+
+        mouse, uinput = self._make_mouse(debounce_module)
+        ev = make_event(ecodes.EV_REL, ecodes.REL_X, 5)
+        result = mouse.process_event(ev)
+
+        assert result is True
+        uinput.write_event.assert_called_once_with(ev)
+
+    def test_measure_lag_returns_value(self, debounce_module):
+        """_measure_lag() should return a float on second+ calls."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module)
+
+        # First call calibrates, returns None
+        ev1 = make_event(ecodes.EV_REL, ecodes.REL_X, 1)
+        result1 = mouse._measure_lag(ev1)
+        assert result1 is None
+
+        # Second call with kernel timestamp 5ms in the past to guarantee
+        # positive lag (avoids recalibration from near-zero jitter)
+        ev2 = make_event(ecodes.EV_REL, ecodes.REL_X, 1)
+        ev2.usec -= 5000  # 5ms older kernel timestamp
+        result2 = mouse._measure_lag(ev2)
+        assert isinstance(result2, float)
+
+    def test_move_forwarded_count_increments(self, debounce_module):
+        """_move_forwarded_count should increment for each movement write."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module)
+        for _ in range(3):
+            mouse.process_event(make_event(ecodes.EV_REL, ecodes.REL_X, 5))
+
+        assert mouse._move_diag._move_forwarded_count == 3
+
+
+class TestX11PointerProbe:
+    """Tests for X11PointerProbe stall detection logic."""
+
+    def _make_probe(self, debounce_module):
+        diag = debounce_module.MoveDiagnostics()
+        probe = debounce_module.X11PointerProbe(diag)
+        return probe, diag
+
+    def test_check_stall_detects_stall(self, debounce_module):
+        """10+ polls with increasing count but same position = stall."""
+        probe, diag = self._make_probe(debounce_module)
+        # Initial call to establish position baseline
+        probe._check_stall(100, 200, count=0)
+        # Simulate 10 consecutive stall samples (events forwarded, pointer stuck)
+        for i in range(10):
+            result = probe._check_stall(100, 200, count=i + 1)
+        assert result is True
+        assert diag.x11_stalls >= 1
+
+    def test_check_stall_no_false_positive_when_idle(self, debounce_module):
+        """Same position and same count (no new events) = not a stall."""
+        probe, diag = self._make_probe(debounce_module)
+        for _ in range(15):
+            result = probe._check_stall(100, 200, count=0)
+        assert diag.x11_stalls == 0
+
+    def test_check_stall_no_false_positive_when_moving(self, debounce_module):
+        """Increasing count with changing position = pointer is moving, no stall."""
+        probe, diag = self._make_probe(debounce_module)
+        for i in range(15):
+            probe._check_stall(100 + i, 200 + i, count=i + 1)
+        assert diag.x11_stalls == 0
+
+    def test_check_stall_resets_on_movement(self, debounce_module):
+        """Stall counter should reset when pointer moves again."""
+        probe, diag = self._make_probe(debounce_module)
+        # Build up 5 stall samples (not enough for a stall event)
+        for i in range(5):
+            probe._check_stall(100, 200, count=i + 1)
+        # Pointer moves — should reset counter
+        probe._check_stall(110, 210, count=6)
+        # Continue with same position — needs 10 more to trigger
+        for i in range(9):
+            probe._check_stall(110, 210, count=7 + i)
+        assert diag.x11_stalls == 0  # Not enough after reset
+
+    def test_graceful_degradation(self, debounce_module):
+        """start() should return False when DISPLAY is unavailable."""
+        diag = debounce_module.MoveDiagnostics()
+        probe = debounce_module.X11PointerProbe(diag)
+        with patch.dict('os.environ', {}, clear=True):
+            # Remove DISPLAY from environment
+            result = probe.start()
+        assert result is False
+
+
 class TestDeviceMonitor:
     """Tests for inotify-based device hotplug monitoring.
 

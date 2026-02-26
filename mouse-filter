@@ -181,6 +181,214 @@ def check_new_device(path, existing_paths):
     return None
 
 
+class MoveDiagnostics:
+    """Per-interval movement pipeline telemetry.
+
+    Tracks metrics across 4 pipeline stages:
+      1. Input delivery (kernel→read lag, Hz)
+      2. Batch + loop (events per read, select-loop iteration time)
+      3. Write latency (uinput write_event timing)
+      4. X11 delivery (pointer stalls, written by X11PointerProbe)
+
+    Created per-mouse only when --diagnose-move is active.
+    """
+
+    # Thresholds
+    BATCH_THRESHOLD = 10       # >10 events per read() = large batch
+    LOOP_STALL_MS = 2.0        # >2ms loop iteration = stall
+    WRITE_SLOW_S = 0.0005      # >0.5ms write = slow
+
+    def __init__(self, lag_threshold_ms=10):
+        self.lag_threshold_ms = lag_threshold_ms
+        self._interval_start = time.monotonic()
+        self._move_forwarded_count = 0  # Monotonic, not reset (X11 probe reads it)
+
+        # Stage 1: Input delivery
+        self.move_count = 0
+        self.move_max_lag_ms = 0.0
+        self.move_lag_spikes = 0
+
+        # Stage 2: Batch + loop
+        self.max_batch_size = 0
+        self.total_batches = 0
+        self.large_batch_count = 0
+        self.loop_max_ms = 0.0
+        self.loop_stall_count = 0
+
+        # Stage 3: Write latency
+        self.write_count = 0
+        self.write_slow_count = 0
+        self.write_max_s = 0.0
+
+        # Stage 4: X11 (written by X11PointerProbe thread)
+        self.x11_stalls = 0
+
+    def record_input(self, lag_ms):
+        """Record a movement event with its input delivery lag.
+
+        lag_ms may be None during calibration (first event).
+        """
+        self.move_count += 1
+        if lag_ms is None:
+            return
+        if lag_ms > self.move_max_lag_ms:
+            self.move_max_lag_ms = lag_ms
+        if lag_ms > self.lag_threshold_ms:
+            self.move_lag_spikes += 1
+
+    def record_batch(self, size):
+        """Record a device.read() batch size."""
+        self.total_batches += 1
+        if size > self.max_batch_size:
+            self.max_batch_size = size
+        if size > self.BATCH_THRESHOLD:
+            self.large_batch_count += 1
+
+    def record_loop_time(self, ms):
+        """Record a select-loop iteration duration in ms."""
+        if ms > self.loop_max_ms:
+            self.loop_max_ms = ms
+        if ms > self.LOOP_STALL_MS:
+            self.loop_stall_count += 1
+
+    def record_write(self, elapsed_s):
+        """Record a uinput write_event elapsed time in seconds."""
+        self.write_count += 1
+        if elapsed_s > self.write_max_s:
+            self.write_max_s = elapsed_s
+        if elapsed_s > self.WRITE_SLOW_S:
+            self.write_slow_count += 1
+
+    def hz(self):
+        """Return approximate movement event rate in Hz."""
+        elapsed = time.monotonic() - self._interval_start
+        if elapsed <= 0:
+            return 0.0
+        return self.move_count / elapsed
+
+    def verdict(self):
+        """Return a diagnostic verdict string. Priority order."""
+        if self.move_lag_spikes > 0:
+            return "INPUT_LAG"
+        if self.loop_stall_count > 0:
+            return "LOOP_STALL"
+        if self.write_slow_count > 0:
+            return "WRITE_LAG"
+        if self.x11_stalls > 0:
+            return "X11_STALL"
+        return "CLEAN"
+
+    def report(self):
+        """Format a single-line diagnostic report."""
+        return (
+            f"MOVE_DIAG: rate={self.hz():.0f}Hz "
+            f"input(max={self.move_max_lag_ms:.1f}ms spikes={self.move_lag_spikes}) "
+            f"batch(max={self.max_batch_size}) "
+            f"loop(max={self.loop_max_ms:.1f}ms stalls={self.loop_stall_count}) "
+            f"write(max={self.write_max_s * 1000:.2f}ms) "
+            f"x11(stalls={self.x11_stalls}) "
+            f"-> {self.verdict()}"
+        )
+
+    def reset(self):
+        """Clear per-interval counters. Preserves _move_forwarded_count."""
+        self._interval_start = time.monotonic()
+        self.move_count = 0
+        self.move_max_lag_ms = 0.0
+        self.move_lag_spikes = 0
+        self.max_batch_size = 0
+        self.total_batches = 0
+        self.large_batch_count = 0
+        self.loop_max_ms = 0.0
+        self.loop_stall_count = 0
+        self.write_count = 0
+        self.write_slow_count = 0
+        self.write_max_s = 0.0
+        self.x11_stalls = 0
+
+
+class X11PointerProbe:
+    """Daemon thread polling XQueryPointer to detect downstream stalls.
+
+    Polls at 200Hz. If _move_forwarded_count increased since last poll but
+    the pointer position hasn't changed, that's a stall sample. 10 consecutive
+    stall samples (~50ms) = one x11_stall event on the MoveDiagnostics instance.
+
+    Gracefully degrades: if $DISPLAY unavailable or Xlib import fails,
+    start() returns False and the probe is skipped.
+    """
+
+    POLL_HZ = 200
+    STALL_SAMPLES = 10  # 10 polls at 200Hz = 50ms
+
+    def __init__(self, diag):
+        self._diag = diag
+        self._thread = None
+        self._running = False
+        # State for stall detection
+        self._last_x = None
+        self._last_y = None
+        self._last_count = 0
+        self._stall_counter = 0
+
+    def _check_stall(self, x, y, count):
+        """Check if the pointer is stalled. Returns True if a stall event fired.
+
+        Callable from tests without threading.
+        """
+        events_forwarded = count > self._last_count
+        pointer_moved = (x != self._last_x or y != self._last_y)
+
+        if events_forwarded and not pointer_moved:
+            self._stall_counter += 1
+        else:
+            self._stall_counter = 0
+
+        self._last_x = x
+        self._last_y = y
+        self._last_count = count
+
+        if self._stall_counter >= self.STALL_SAMPLES:
+            self._diag.x11_stalls += 1
+            self._stall_counter = 0
+            return True
+        return False
+
+    def _poll_loop(self, display):
+        """Poll XQueryPointer in a loop. Runs in daemon thread."""
+        interval = 1.0 / self.POLL_HZ
+        root = display.screen().root
+        while self._running:
+            try:
+                qp = root.query_pointer()
+                self._check_stall(qp.root_x, qp.root_y,
+                                  self._diag._move_forwarded_count)
+            except Exception:
+                pass
+            time.sleep(interval)
+
+    def start(self):
+        """Start the probe thread. Returns False if X11 unavailable."""
+        if not os.environ.get('DISPLAY'):
+            return False
+        try:
+            from Xlib import display as xdisplay
+            d = xdisplay.Display()
+        except Exception:
+            return False
+        self._running = True
+        self._thread = __import__('threading').Thread(
+            target=self._poll_loop, args=(d,), daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self):
+        """Stop the probe thread."""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
+
+
 class DebouncedMouse:
     """Wraps a single mouse device with debounce filtering."""
 
@@ -271,7 +479,7 @@ class DelayedDebouncedMouse:
 
     def __init__(self, device, threshold_ms, warn_threshold_ms=None,
                  hold_threshold_ms=None, quiet=False, lag_threshold_ms=10,
-                 button_remap=None):
+                 button_remap=None, diagnose_move=False):
         self.device = device
         self.threshold_s = threshold_ms / 1000.0
         self.button_remap = button_remap or {}  # {src_code: dst_code}
@@ -295,6 +503,9 @@ class DelayedDebouncedMouse:
         self.max_lag_ms = 0.0
         self._wall_offset = None  # Calibrated offset: wall_clock - kernel_timestamp
 
+        # Movement diagnostics (only when --diagnose-move is active)
+        self._move_diag = MoveDiagnostics(lag_threshold_ms=lag_threshold_ms) if diagnose_move else None
+
         # Build uinput device. If we have remaps, add target key codes to
         # the capabilities — the physical mouse doesn't advertise KEY_VOLUMEUP etc,
         # so uinput would silently drop those events without this.
@@ -313,23 +524,27 @@ class DelayedDebouncedMouse:
         device.grab()
 
     def _measure_lag(self, event):
-        """Measure lag between kernel event timestamp and our processing time."""
+        """Measure lag between kernel event timestamp and our processing time.
+
+        Returns lag_ms (float) on successful measurement, None on calibration
+        or error. The return value is used by MoveDiagnostics when active.
+        """
         self.total_events += 1
         # evdev events carry kernel timestamps (event.sec, event.usec)
         try:
             kernel_ts = event.sec + event.usec / 1_000_000.0
         except (AttributeError, TypeError):
-            return
+            return None
         wall_now = time.time()
         # Calibrate offset on first event
         if self._wall_offset is None:
             self._wall_offset = wall_now - kernel_ts
-            return
+            return None
         lag_ms = (wall_now - kernel_ts - self._wall_offset) * 1000
         # Ignore negative lag (clock drift recalibration)
         if lag_ms < 0:
             self._wall_offset = wall_now - kernel_ts
-            return
+            return None
         if lag_ms > self.max_lag_ms:
             self.max_lag_ms = lag_ms
         if lag_ms > self.lag_threshold_ms:
@@ -337,10 +552,16 @@ class DelayedDebouncedMouse:
             log(f"LAG_SPIKE on {self.name}: {lag_ms:.1f}ms "
                 f"(event_type={event.type}, code={event.code}, "
                 f"spikes={self.lag_spikes}/{self.total_events})")
+        return lag_ms
 
     def process_event(self, event):
         now = time.monotonic()
-        self._measure_lag(event)
+        lag_ms = self._measure_lag(event)
+
+        # Record movement events in diagnostics
+        is_movement = event.type == ecodes.EV_REL
+        if self._move_diag and is_movement:
+            self._move_diag.record_input(lag_ms)
 
         # Button remapping: transform code and forward immediately (no debounce)
         if event.type == ecodes.EV_KEY and event.code in self.button_remap:
@@ -350,7 +571,13 @@ class DelayedDebouncedMouse:
             return True
 
         if event.type != ecodes.EV_KEY or event.code not in BUTTON_CODES:
-            self.uinput.write_event(event)
+            if self._move_diag and is_movement:
+                t0 = time.monotonic()
+                self.uinput.write_event(event)
+                self._move_diag.record_write(time.monotonic() - t0)
+                self._move_diag._move_forwarded_count += 1
+            else:
+                self.uinput.write_event(event)
             return True
 
         btn = event.code
@@ -486,6 +713,10 @@ def main():
     parser.add_argument("--remap", action="append", metavar="SRC=DST",
                         help="Remap a button to a key, e.g. BTN_EXTRA=KEY_VOLUMEUP. "
                              "Remapped buttons bypass debounce. Can be specified multiple times.")
+    parser.add_argument("--diagnose-move", action="store_true",
+                        help="Enable movement pipeline diagnostics. Reports per-stage "
+                             "latency breakdown (input, batch, loop, write, X11) at each "
+                             "stats interval. Use to identify cursor lag sources.")
     args = parser.parse_args()
 
     # Parse button remaps
@@ -531,7 +762,8 @@ def main():
                                        hold_threshold_ms=args.hold_threshold,
                                        quiet=args.quiet,
                                        lag_threshold_ms=args.lag_threshold,
-                                       button_remap=button_remap)
+                                       button_remap=button_remap,
+                                       diagnose_move=args.diagnose_move)
             mice.append(dm)
             log(f"Filtering: {dev.name} ({dev.path}) -> {dm.uinput.name}")
         except Exception as e:
@@ -570,6 +802,8 @@ def main():
             return str(code)
         for src, dst in button_remap.items():
             log(f"    Remap:                   {_ecode_name(src)} ({src}) -> {_ecode_name(dst)} ({dst})")
+    if args.diagnose_move:
+        log(f"  Move diagnostics:  ENABLED (reports at each stats interval)")
 
     running = True
 
@@ -593,6 +827,18 @@ def main():
         else:
             log(f"  Device hotplug:    inotify unavailable, no auto-reconnect")
 
+    # Start X11 pointer probe for move diagnostics
+    x11_probe = None
+    if args.diagnose_move:
+        # Use the first mouse's diag instance for the probe
+        first_diag = mice[0]._move_diag
+        x11_probe = X11PointerProbe(first_diag)
+        if x11_probe.start():
+            log(f"  X11 probe:         active (polling at {X11PointerProbe.POLL_HZ}Hz)")
+        else:
+            log(f"  X11 probe:         unavailable (no $DISPLAY or Xlib)")
+            x11_probe = None
+
     while running:
         # Calculate select timeout: need to flush pending releases on time
         timeout = None
@@ -613,14 +859,24 @@ def main():
         except (KeyboardInterrupt, ValueError):
             break
 
+        loop_start = time.monotonic()
+
         # Process readable devices
         for fd in readable:
             if fd == monitor_fd:
                 continue  # Handle inotify below
             mouse = fd_map[fd]
             try:
-                for event in mouse.device.read():
-                    mouse.process_event(event)
+                if args.diagnose_move:
+                    # Materialize to list for batch counting
+                    events = list(mouse.device.read())
+                    if mouse._move_diag:
+                        mouse._move_diag.record_batch(len(events))
+                    for event in events:
+                        mouse.process_event(event)
+                else:
+                    for event in mouse.device.read():
+                        mouse.process_event(event)
             except OSError:
                 log(f"Device disconnected: {mouse.name}")
                 mouse.close()
@@ -642,7 +898,8 @@ def main():
                         hold_threshold_ms=args.hold_threshold,
                         quiet=args.quiet,
                         lag_threshold_ms=args.lag_threshold,
-                        button_remap=button_remap)
+                        button_remap=button_remap,
+                        diagnose_move=args.diagnose_move)
                     mice.append(dm)
                     fd_map[dm.device.fd] = dm
                     active_paths.add(dev.path)
@@ -654,17 +911,36 @@ def main():
         for m in mice:
             m.flush_pending()
 
+        # Record loop iteration time for diagnostics
+        if args.diagnose_move:
+            loop_elapsed_ms = (time.monotonic() - loop_start) * 1000
+            for m in mice:
+                if m._move_diag:
+                    m._move_diag.record_loop_time(loop_elapsed_ms)
+
         # Periodic stats
         now = time.monotonic()
         if now - last_stats > args.stats_interval:
             for m in mice:
-                log(f"STATS: {m.name}: clicks={m.total_clicks}, "
-                    f"suppressed={m.suppressed}, events={m.total_events}, "
-                    f"lag_spikes={m.lag_spikes}, max_lag={m.max_lag_ms:.1f}ms")
+                # When diagnose-move is active, suppress stats for clean intervals
+                if m._move_diag:
+                    verdict = m._move_diag.verdict()
+                    if verdict != "CLEAN":
+                        log(f"STATS: {m.name}: clicks={m.total_clicks}, "
+                            f"suppressed={m.suppressed}, events={m.total_events}, "
+                            f"lag_spikes={m.lag_spikes}, max_lag={m.max_lag_ms:.1f}ms")
+                        log(m._move_diag.report())
+                    m._move_diag.reset()
+                else:
+                    log(f"STATS: {m.name}: clicks={m.total_clicks}, "
+                        f"suppressed={m.suppressed}, events={m.total_events}, "
+                        f"lag_spikes={m.lag_spikes}, max_lag={m.max_lag_ms:.1f}ms")
                 m.max_lag_ms = 0.0  # Reset per interval
             last_stats = now
 
     # Cleanup
+    if x11_probe:
+        x11_probe.stop()
     if monitor_fd >= 0:
         os.close(monitor_fd)
     for m in mice:

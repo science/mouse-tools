@@ -46,6 +46,7 @@ Configure via `--remap SRC=DST` CLI flag (repeatable).
 | `SUPPRESSED` | Drag-bounce caught (release→re-press within threshold after long hold) | Yes |
 | `NEAR-MISS` | Release→re-press gap escaped threshold but within warn window, after drag | Yes |
 | `STATS` | Periodic summary (clicks, suppressions, lag) | Yes |
+| `MOVE_DIAG` | Per-stage movement latency breakdown (--diagnose-move only) | Yes |
 | Fast double-click allowed | Short hold + fast re-press (normal behavior) | No — silent by design |
 
 ## Development Rules
@@ -71,6 +72,8 @@ Configure via `--remap SRC=DST` CLI flag (repeatable).
 ## Classes
 
 - **`DelayedDebouncedMouse`** — The production implementation. Handles remapping, delayed releases, bounce suppression. This is the one that matters.
+- **`MoveDiagnostics`** — Per-interval movement pipeline telemetry. Tracks 4 stages: input delivery lag/Hz, batch sizes, loop iteration time, uinput write latency. Also holds `x11_stalls` counter written by X11PointerProbe. Created per-mouse only when `--diagnose-move` is active.
+- **`X11PointerProbe`** — Daemon thread polling `XQueryPointer` at 200Hz to detect downstream pointer stalls. If events are forwarded but the pointer hasn't moved for 50ms, logs an `x11_stall`. Gracefully degrades when `$DISPLAY` unavailable.
 - **`DebouncedMouse`** — Earlier approach (suppress on re-press, no release delay). Kept for reference but not used. Can be removed.
 - **`FocusMonitor`** (in drag-monitor) — Watches `_NET_ACTIVE_WINDOW` via xprop.
 - **`BTSuspendMonitor`** (in drag-monitor) — Polls BT adapter USB power state.
@@ -98,6 +101,12 @@ Add `--remap BTN_xxx=KEY_yyy` to `run.sh` and `install.sh` ExecStart line.
 
 ### Add a new button to debounce
 Add the `ecodes.BTN_*` constant to `BUTTON_CODES` set.
+
+### Diagnose movement lag
+Use `--diagnose-move` to instrument each stage of the movement pipeline. Reports at each stats interval with a verdict (`CLEAN`, `INPUT_LAG`, `LOOP_STALL`, `WRITE_LAG`, `X11_STALL`).
+```bash
+sudo ./run.sh --diagnose-move --stats-interval 30
+```
 
 ### Run manually
 ```bash

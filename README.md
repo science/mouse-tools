@@ -93,6 +93,7 @@ Options:
   --quiet               Suppress per-event logging (SUPPRESSED/NEAR-MISS still log)
   --stats-interval N    Print stats every N seconds (default: 600)
   --log-dir PATH        Directory for log files
+  --diagnose-move       Enable movement pipeline diagnostics (see below)
 ```
 
 ## Logging
@@ -104,10 +105,41 @@ Events are logged to `~/.local/share/mouse-filter/debounce.log` (uses `$SUDO_USE
 | `SUPPRESSED` | Drag-bounce caught and filtered. Shows the release→re-press gap and hold duration. Always logged. |
 | `NEAR-MISS` | Release→re-press gap was between threshold and warn-threshold, after a drag hold. The filter didn't catch it. Consider raising `--threshold`. Always logged. |
 | `STATS` | Periodic summary: total clicks, suppressions, events processed, lag spikes, max lag per device. |
+| `MOVE_DIAG` | Movement pipeline breakdown with per-stage latency (only with `--diagnose-move`). |
 
 Fast double-clicks (short hold < 150ms followed by fast re-press) are silently allowed through without logging — they're normal user behavior, not bounces.
 
-## Diagnostics
+## Movement Diagnostics
+
+Use `--diagnose-move` to instrument each stage of the movement pipeline when investigating cursor lag or jerkiness. Reports are suppressed for clean intervals — you only see output when something is wrong.
+
+```bash
+sudo ./run.sh --diagnose-move --stats-interval 30
+```
+
+When a problem is detected, you'll see a line like:
+
+```
+MOVE_DIAG: rate=99Hz input(max=0.4ms spikes=0) batch(max=48) loop(max=35.3ms stalls=3) write(max=0.17ms) x11(stalls=0) -> LOOP_STALL
+```
+
+### Pipeline Stages
+
+```
+kernel timestamp → [1: Input] → our read() → [2: Loop] → process_event()
+  → [3: Write] → write_event() → [4: X11] → compositor → display
+```
+
+| Stage | Metrics | Problem Verdict | Likely Cause |
+|-------|---------|-----------------|--------------|
+| Input | lag vs kernel timestamp, event rate (Hz) | `INPUT_LAG` | Kernel scheduling delay, interrupt latency |
+| Loop | batch size per read(), select-loop iteration time | `LOOP_STALL` | System contention (e.g., WiFi firmware crash, I/O stall) |
+| Write | uinput write_event() duration | `WRITE_LAG` | uinput buffer pressure, kernel contention |
+| X11 | pointer movement stalls (via XQueryPointer polling) | `X11_STALL` | Compositor lag, GPU stall |
+
+If all stages are clean, the verdict is `CLEAN` and nothing is printed.
+
+## Drag Monitor
 
 The `mouse-drag-monitor` tool helps diagnose the root cause of phantom releases before applying the debounce filter. It monitors raw evdev, X11 focus changes, and BT adapter power state.
 
