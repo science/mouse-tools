@@ -1494,3 +1494,103 @@ class TestClickDiagnostics:
         msg = diag_calls[0].args[0]
         assert 'rp_gap=' in msg
         assert 'rp_gap=--' not in msg  # Should have a real value
+
+
+class TestQuietMode:
+    """Tests for --quiet stats suppression.
+
+    In quiet mode, STATS should only log when something notable happened
+    (suppressions or lag spikes) since the last stats interval.
+    """
+
+    def _make_mouse(self, debounce_module, threshold_ms=60):
+        from evdev import ecodes
+
+        mock_device = MagicMock()
+        mock_device.name = "Test Mouse"
+        mock_device.fd = 99
+        mock_uinput = MagicMock()
+
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.from_device.return_value = mock_uinput
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, threshold_ms, quiet=True,
+            )
+        return mouse, mock_uinput
+
+    def test_no_notable_events_on_fresh_instance(self, debounce_module):
+        """Fresh instance should have no notable events."""
+        mouse, _ = self._make_mouse(debounce_module)
+        assert mouse.has_notable_events() is False
+
+    def test_suppression_is_notable(self, debounce_module):
+        """A drag bounce suppression should make has_notable_events() True."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module, threshold_ms=60)
+
+        # Drag + bounce → suppression
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)  # drag
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+
+        assert mouse.suppressed == 1
+        assert mouse.has_notable_events() is True
+
+    def test_record_stats_resets_notable(self, debounce_module):
+        """After record_stats(), has_notable_events() should be False again."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module, threshold_ms=60)
+
+        # Trigger a suppression
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+
+        assert mouse.has_notable_events() is True
+        mouse.record_stats()
+        assert mouse.has_notable_events() is False
+
+    def test_lag_spike_is_notable(self, debounce_module):
+        """A lag spike should make has_notable_events() True."""
+        mouse, _ = self._make_mouse(debounce_module)
+        mouse.lag_spikes = 1  # Simulate a spike
+        assert mouse.has_notable_events() is True
+
+    def test_new_events_after_record_stats(self, debounce_module):
+        """New notable events after record_stats() should trigger again."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module, threshold_ms=60)
+
+        # First suppression
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        mouse.record_stats()
+        assert mouse.has_notable_events() is False
+
+        # Second suppression (need a new drag)
+        time.sleep(0.2)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        assert mouse.suppressed == 2
+        assert mouse.has_notable_events() is True
+
+    def test_normal_clicks_not_notable(self, debounce_module):
+        """Normal clicks without any issues should not be notable."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module)
+
+        # Normal click cycle
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        time.sleep(0.07)
+        mouse.flush_pending()
+
+        assert mouse.has_notable_events() is False

@@ -4,7 +4,6 @@ set -euo pipefail
 INSTALL_BIN="/usr/local/bin/mouse-filter"
 INSTALL_MONITOR="/usr/local/bin/mouse-drag-monitor"
 SERVICE_FILE="/etc/systemd/system/mouse-filter.service"
-LOGROTATE_FILE="/etc/logrotate.d/mouse-filter"
 LOG_DIR="/var/log/mouse-filter"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -49,6 +48,9 @@ do_install() {
     [[ -f /usr/local/bin/mouse-debounce ]] && rm /usr/local/bin/mouse-debounce
     [[ -f /etc/logrotate.d/mouse-debounce ]] && rm /etc/logrotate.d/mouse-debounce
 
+    # Clean up legacy logrotate config (log capping is now built into mouse-filter)
+    [[ -f /etc/logrotate.d/mouse-filter ]] && rm /etc/logrotate.d/mouse-filter
+
     echo "Installing mouse-filter..."
 
     # Install binaries
@@ -66,21 +68,6 @@ do_install() {
     mkdir -p "$LOG_DIR"
     echo "  Created $LOG_DIR"
 
-    # Install logrotate config
-    cat > "$LOGROTATE_FILE" <<'LOGROTATE'
-/var/log/mouse-filter/debounce.log {
-    weekly
-    rotate 4
-    compress
-    delaycompress
-    missingok
-    notifempty
-    size 5M
-    copytruncate
-}
-LOGROTATE
-    echo "  Installed $LOGROTATE_FILE"
-
     # Install systemd service
     cat > "$SERVICE_FILE" <<UNIT
 [Unit]
@@ -89,7 +76,7 @@ After=multi-user.target
 
 [Service]
 Type=simple
-ExecStart=$INSTALL_BIN --quiet --log-dir $LOG_DIR --remap BTN_EXTRA=KEY_VOLUMEUP --remap BTN_SIDE=KEY_VOLUMEDOWN --remap BTN_MIDDLE=KEY_MUTE
+ExecStart=$INSTALL_BIN --quiet --threshold 70 --log-dir $LOG_DIR --remap BTN_EXTRA=KEY_VOLUMEUP --remap BTN_SIDE=KEY_VOLUMEDOWN --remap BTN_MIDDLE=KEY_MUTE
 Restart=on-failure
 RestartSec=3
 
@@ -141,10 +128,7 @@ do_uninstall() {
         echo "  Removed $SERVICE_FILE"
     fi
 
-    if [[ -f "$LOGROTATE_FILE" ]]; then
-        rm "$LOGROTATE_FILE"
-        echo "  Removed $LOGROTATE_FILE"
-    fi
+    [[ -f /etc/logrotate.d/mouse-filter ]] && rm /etc/logrotate.d/mouse-filter
 
     if [[ -f "$INSTALL_BIN" ]]; then
         rm "$INSTALL_BIN"

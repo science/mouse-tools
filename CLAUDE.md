@@ -10,21 +10,21 @@ A collection of mouse management utilities for Linux, built on evdev. A single `
 
 Tools:
 
-- **`mouse-filter`** — The main filter. Grabs raw evdev mouse devices, remaps configured buttons, debounces button releases. Creates virtual `debounced <name>` devices via uinput. Runs as a systemd service or manually via `run.sh`.
+- **`mouse-filter`** — The main filter. Grabs raw evdev mouse devices, remaps configured buttons, debounces drag releases. Creates virtual `debounced <name>` devices via uinput. Runs as a systemd service or manually via `run.sh`.
 - **`mouse-drag-monitor`** — Diagnostic tool. Monitors raw evdev + X11 focus + BT adapter power state to identify the source of phantom releases. Used during investigation, not in production.
 - **`run.sh`** — Quick-launch wrapper with standard volume remap config. Passes through extra args.
 
-### Debounce Strategy (Delayed Release)
+### Debounce Strategy (Drag-Only Delayed Release)
 
 ```
-Hardware: press ──────────── release(bounce) ── press(bounce) ──────── release(real)
-Filter:   press ──────────── [hold 60ms...]  ── suppress both ──────── [hold 60ms...] → release
-Output:   press ──────────────────────────────────────────────────────────────────────── release
+Drag:     press ─────────[>=150ms]───── release(bounce) ── press(bounce) ──── release(real)
+Filter:   press ─────────────────────── [hold 70ms...]  ── suppress both ──── [hold 70ms...] → release
+Output:   press ──────────────────────────────────────────────────────────────────────────────── release
+
+Click:    press ──[<150ms]── release → forwarded immediately (no delay, no interference)
 ```
 
-Button releases are held for `threshold` ms. If a re-press arrives during the hold, both are suppressed (the button was never really released). Genuine releases get `threshold` ms of added latency.
-
-**Hold-aware**: Only drag-bounces (hold >= 150ms) are suppressed. Fast double-clicks (hold < 150ms) are always allowed through silently — they're normal user behavior.
+Only drag releases (hold >= 150ms) are delayed for bounce detection. Click releases (hold < 150ms) are forwarded immediately with zero latency — this ensures fast double-clicks always work.
 
 ### Event Pipeline
 
@@ -43,11 +43,17 @@ Configure via `--remap SRC=DST` CLI flag (repeatable).
 
 | Event | When | Logged in --quiet? |
 |-------|------|-------------------|
-| `SUPPRESSED` | Drag-bounce caught (release→re-press within threshold after long hold) | Yes |
-| `NEAR-MISS` | Release→re-press gap escaped threshold but within warn window, after drag | Yes |
-| `STATS` | Periodic summary (clicks, suppressions, lag) | Yes |
-| `MOVE_DIAG` | Per-stage movement latency breakdown (--diagnose-move only) | Yes |
-| Fast double-click allowed | Short hold + fast re-press (normal behavior) | No — silent by design |
+| `SUPPRESSED` | Drag-bounce caught (release→re-press within threshold after long hold) | Yes (always) |
+| `NEAR-MISS` | Release→re-press gap escaped threshold but within warn window, after drag | Yes (always) |
+| `LAG_SPIKE` | Event processing lags behind kernel timestamp | Yes (always) |
+| `STATS` | Periodic summary (clicks, suppressions, lag) | Only when notable events occurred |
+| `MOVE_DIAG` | Per-stage movement latency breakdown (--diagnose-move only) | Only when non-CLEAN |
+| `CLICK_DIAG` | Per-click decision logging (--diagnose-clicks only) | File only (not stdout) |
+| Startup config | Full configuration banner | File only in --quiet; both otherwise |
+
+### Log File Management
+
+The log file (`~/.local/share/mouse-filter/debounce.log` or `--log-dir`) is capped to 2000 lines on startup using `tail`. No logrotate dependency.
 
 ## Development Rules
 
@@ -55,7 +61,7 @@ Configure via `--remap SRC=DST` CLI flag (repeatable).
 2. **Requires root for integration testing** — evdev grab + uinput need root. Unit tests should mock evdev where possible.
 3. **Test with `pytest`** — Test files in `tests/`. Run: `pytest tests/`
 4. **Don't break the filter loop** — The select() event loop is latency-sensitive. Avoid blocking operations, GC pressure, or heavy computation in the hot path.
-5. **Log levels matter** — SUPPRESSED and NEAR-MISS always log. Normal events only log without `--quiet`. Stats log on interval. Don't add noisy logging to the hot path.
+5. **Log levels matter** — SUPPRESSED, NEAR-MISS, LAG_SPIKE always log. STATS only log in --quiet when notable. Don't add noisy logging to the hot path.
 
 ## Key Files
 
@@ -71,7 +77,7 @@ Configure via `--remap SRC=DST` CLI flag (repeatable).
 
 ## Classes
 
-- **`DelayedDebouncedMouse`** — The production implementation. Handles remapping, delayed releases, bounce suppression. This is the one that matters.
+- **`DelayedDebouncedMouse`** — The production implementation. Handles remapping, immediate click releases, delayed drag releases, bounce suppression. This is the one that matters.
 - **`MoveDiagnostics`** — Per-interval movement pipeline telemetry. Tracks 4 stages: input delivery lag/Hz, batch sizes, loop iteration time, uinput write latency. Also holds `x11_stalls` counter written by X11PointerProbe. Created per-mouse only when `--diagnose-move` is active.
 - **`X11PointerProbe`** — Daemon thread polling `XQueryPointer` at 200Hz to detect downstream pointer stalls. If events are forwarded but the pointer hasn't moved for 50ms, logs an `x11_stall`. Gracefully degrades when `$DISPLAY` unavailable.
 - **`DebouncedMouse`** — Earlier approach (suppress on re-press, no release delay). Kept for reference but not used. Can be removed.
@@ -90,11 +96,13 @@ Unit tests should test `DelayedDebouncedMouse` logic by mocking evdev devices:
 - Verify button remapping transforms codes correctly
 - Verify remapped buttons are NOT debounced (forwarded immediately)
 - Verify uinput capabilities include remap target keycodes
+- Verify click releases forwarded immediately, drag releases delayed
+- Verify `has_notable_events()` / `record_stats()` for --quiet mode
 
 ## Common Tasks
 
 ### Adjust threshold
-Change `DEBOUNCE_MS` constant (default: 60). CLI override: `--threshold N`.
+Change `DEBOUNCE_MS` constant (default: 60). CLI override: `--threshold N`. Production uses 70ms.
 
 ### Add a new button remap
 Add `--remap BTN_xxx=KEY_yyy` to `run.sh` and `install.sh` ExecStart line.
@@ -121,3 +129,6 @@ sudo ./mouse-filter --threshold 70     # direct invocation, no remaps
 sudo ./install.sh                      # install + enable + start
 sudo ./install.sh --uninstall          # stop + disable + remove
 ```
+
+### Deploy via yadm
+The service is deployed through `sudo ./install.sh` and verified by `~/.config/yadm/test-dotfiles.sh` (tests under `framework13|linux-bambam`). The `python3-evdev` dependency is in `~/.config/yadm/packages/apt-desktop.txt`.

@@ -506,6 +506,9 @@ class DelayedDebouncedMouse:
         self.lag_spikes = 0
         self.max_lag_ms = 0.0
         self._wall_offset = None  # Calibrated offset: wall_clock - kernel_timestamp
+        # Per-interval stats tracking (for --quiet: only log when notable)
+        self._last_stats_suppressed = 0
+        self._last_stats_lag_spikes = 0
 
         # Movement diagnostics (only when --diagnose-move is active)
         self._move_diag = MoveDiagnostics(lag_threshold_ms=lag_threshold_ms) if diagnose_move else None
@@ -708,6 +711,16 @@ class DelayedDebouncedMouse:
         except Exception:
             pass
 
+    def has_notable_events(self):
+        """True if suppressions or lag spikes occurred since last stats."""
+        return (self.suppressed > self._last_stats_suppressed or
+                self.lag_spikes > self._last_stats_lag_spikes)
+
+    def record_stats(self):
+        """Snapshot current counts for next interval comparison."""
+        self._last_stats_suppressed = self.suppressed
+        self._last_stats_lag_spikes = self.lag_spikes
+
 
 def main():
     parser = argparse.ArgumentParser(description="Universal mouse debounce filter")
@@ -725,7 +738,9 @@ def main():
                         help="Log LAG_SPIKE when event processing lags more than "
                              "this many ms behind the kernel timestamp (default: 10)")
     parser.add_argument("--quiet", action="store_true",
-                        help="Suppress per-event logging")
+                        help="Production mode: suppress periodic STATS from stdout, "
+                             "log startup config to file only. Events (SUPPRESSED, "
+                             "NEAR-MISS, LAG_SPIKE) always log.")
     parser.add_argument("--stats-interval", type=int, default=600,
                         help="Print stats every N seconds (default: 600)")
     parser.add_argument("--log-dir", type=str, default=None,
@@ -763,6 +778,11 @@ def main():
     LOG_FILE = LOG_DIR / "debounce.log"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Cap log file to last 2000 lines on startup
+    if LOG_FILE.exists():
+        tmp = f"{LOG_FILE}.tmp"
+        os.system(f'tail -n 2000 "{LOG_FILE}" > "{tmp}" && mv "{tmp}" "{LOG_FILE}"')
+
     if args.device:
         devices = []
         for path in args.device:
@@ -798,24 +818,32 @@ def main():
         log("No devices could be set up.")
         sys.exit(1)
 
-    # Emit full configuration summary at startup
+    # Emit configuration summary at startup
+    # In quiet mode, full config goes to log file only; stdout gets a short summary
+    q = args.quiet
     log(f"mouse-filter started — {len(mice)} device(s)")
     log(f"  Hold threshold:    {args.hold_threshold}ms  "
-        f"(holds < {args.hold_threshold}ms = click, >= {args.hold_threshold}ms = drag)")
+        f"(holds < {args.hold_threshold}ms = click, >= {args.hold_threshold}ms = drag)",
+        also_print=not q)
     log(f"  Debounce window:   {args.threshold}ms  "
-        f"(release held this long before forwarding)")
+        f"(release held this long before forwarding)", also_print=not q)
     log(f"  Warn threshold:    {args.warn_threshold}ms  "
-        f"(NEAR-MISS logged for gaps {args.threshold}–{args.warn_threshold}ms)")
+        f"(NEAR-MISS logged for gaps {args.threshold}–{args.warn_threshold}ms)",
+        also_print=not q)
     log(f"  Lag threshold:     {args.lag_threshold}ms  "
-        f"(LAG_SPIKE logged when processing > {args.lag_threshold}ms behind kernel)")
-    log(f"  Stats interval:    {args.stats_interval}s")
-    log(f"  Quiet mode:        {'on' if args.quiet else 'off'}")
-    log(f"  Log file:          {LOG_FILE}")
-    log(f"")
-    log(f"  Behavior summary:")
-    log(f"    Click releases (hold < {args.hold_threshold}ms):   forwarded immediately")
-    log(f"    Drag releases  (hold >= {args.hold_threshold}ms):  delayed {args.threshold}ms, bounce suppressed")
-    log(f"    Buttons filtered:        LEFT, RIGHT, MIDDLE, SIDE, EXTRA")
+        f"(LAG_SPIKE logged when processing > {args.lag_threshold}ms behind kernel)",
+        also_print=not q)
+    log(f"  Stats interval:    {args.stats_interval}s", also_print=not q)
+    log(f"  Quiet mode:        {'on' if q else 'off'}", also_print=not q)
+    log(f"  Log file:          {LOG_FILE}", also_print=not q)
+    log(f"", also_print=not q)
+    log(f"  Behavior summary:", also_print=not q)
+    log(f"    Click releases (hold < {args.hold_threshold}ms):   forwarded immediately",
+        also_print=not q)
+    log(f"    Drag releases  (hold >= {args.hold_threshold}ms):  delayed {args.threshold}ms, bounce suppressed",
+        also_print=not q)
+    log(f"    Buttons filtered:        LEFT, RIGHT, MIDDLE, SIDE, EXTRA",
+        also_print=not q)
     if button_remap:
         def _ecode_name(code):
             """Get a single human-readable name for an evdev code."""
@@ -825,7 +853,8 @@ def main():
                     return name if isinstance(name, str) else name[-1]
             return str(code)
         for src, dst in button_remap.items():
-            log(f"    Remap:                   {_ecode_name(src)} ({src}) -> {_ecode_name(dst)} ({dst})")
+            log(f"    Remap:                   {_ecode_name(src)} ({src}) -> {_ecode_name(dst)} ({dst})",
+                also_print=not q)
     if args.diagnose_move:
         log(f"  Move diagnostics:  ENABLED (reports at each stats interval)")
     if args.diagnose_clicks:
@@ -949,19 +978,24 @@ def main():
         now = time.monotonic()
         if now - last_stats > args.stats_interval:
             for m in mice:
-                # When diagnose-move is active, suppress stats for clean intervals
+                # In quiet mode, only log stats when something notable happened
+                should_log = not args.quiet or m.has_notable_events()
+
                 if m._move_diag:
                     verdict = m._move_diag.verdict()
                     if verdict != "CLEAN":
+                        should_log = True
+                    if should_log:
                         log(f"STATS: {m.name}: clicks={m.total_clicks}, "
                             f"suppressed={m.suppressed}, events={m.total_events}, "
                             f"lag_spikes={m.lag_spikes}, max_lag={m.max_lag_ms:.1f}ms")
                         log(m._move_diag.report())
                     m._move_diag.reset()
-                else:
+                elif should_log:
                     log(f"STATS: {m.name}: clicks={m.total_clicks}, "
                         f"suppressed={m.suppressed}, events={m.total_events}, "
                         f"lag_spikes={m.lag_spikes}, max_lag={m.max_lag_ms:.1f}ms")
+                m.record_stats()
                 m.max_lag_ms = 0.0  # Reset per interval
             last_stats = now
 
