@@ -1,25 +1,27 @@
 # mouse-tools
 
-Mouse management utilities for Linux, built on evdev. A single `mouse-filter` daemon handles both button debounce and button remapping — replacing the need for separate tools like input-remapper.
+Mouse management utilities for Linux, built on evdev. A single `mouse-filter` daemon handles button remapping and (optionally) hardware-bounce suppression — replacing the need for separate tools like input-remapper.
 
 ## Features
 
-- **Button debounce** — Fixes hardware switch bounce on worn Logitech (and other) mice that causes phantom button releases during drags and false double-clicks.
 - **Button remapping** — Remaps mouse buttons to keyboard keys (e.g., forward/back to volume up/down). A lightweight replacement for input-remapper when all you need is simple button remaps.
+- **Button debounce (opt-in)** — Suppresses phantom button releases on worn Logitech (and other) mice with bouncing micro-switches. Off by default; enable with `--debounce` if your hardware needs it.
 
-## The Problem
+## The Bounce Problem (when --debounce is needed)
 
-Logitech mice use Omron micro-switches that wear out over time. When worn, the switch contacts briefly separate during a sustained press, producing a phantom release→re-press pair (typically 30-70ms gap). This manifests as:
+Logitech mice use Omron micro-switches that can wear out over time. When worn, the switch contacts briefly separate during a sustained press, producing a phantom release→re-press pair (typically 30–70ms gap). This manifests as:
 
 - Lost text selections while drag-highlighting
 - Dropped window grabs while dragging title bars
 - Occasional phantom double-clicks
 
+If you don't see these symptoms, leave `--debounce` off — the filter still grabs your mouse for remapping but adds no latency to button releases.
+
 ## How It Works
 
-### Debounce
+### Debounce (opt-in via `--debounce`)
 
-Intercepts raw evdev events from all physical mice. Button releases are held for a configurable threshold (default: 60ms). If a re-press arrives during the hold window, both events are suppressed — the button was never really released. Genuine releases get the threshold duration of added latency (imperceptible for non-gaming use).
+Intercepts raw evdev events from all physical mice. With `--debounce` enabled, button releases that follow a long hold (a drag) are held for a configurable threshold (default: 60ms). If a re-press arrives during the hold window, both events are suppressed — the button was never really released. Genuine drag releases get the threshold duration of added latency (imperceptible for non-gaming use).
 
 ```
 Hardware: press ──── release(bounce) ── press(bounce) ──── release(real)
@@ -27,6 +29,8 @@ Output:   press ─────────────────────�
 ```
 
 Only drag-bounces are suppressed (holds >= 150ms). Fast double-clicks (holds < 150ms) are always allowed through, even if the gap between clicks is within the debounce window.
+
+When `--debounce` is off (the default), all releases are forwarded immediately — no latency, no suppression.
 
 ### Button Remapping
 
@@ -51,11 +55,14 @@ Physical mouse → /dev/input/eventN → mouse-filter (grabs device)
 ## Quick Start
 
 ```bash
-# Run with debounce + volume button remapping
+# Run with volume button remapping (debounce off by default)
 sudo ./run.sh
 
+# Enable debounce on top
+sudo ./run.sh --debounce --threshold 70
+
 # Or run directly with custom options
-sudo ./mouse-filter --threshold 70 \
+sudo ./mouse-filter \
     --remap BTN_EXTRA=KEY_VOLUMEUP \
     --remap BTN_SIDE=KEY_VOLUMEDOWN \
     --remap BTN_MIDDLE=KEY_MUTE
@@ -81,13 +88,16 @@ sudo ./install.sh --uninstall
 sudo mouse-filter [OPTIONS]
 
 Options:
-  --threshold N         Debounce threshold in ms (default: 60)
+  --debounce            Enable hardware-bounce suppression. Off by default.
+                        When off, all button releases forward immediately and
+                        the threshold/hold/warn settings below are inert.
+  --threshold N         Debounce window in ms (default: 60). Only used with --debounce.
   --hold-threshold N    Only debounce releases after holds longer than N ms.
                         Short clicks below this are never debounced. (default: 150)
   --warn-threshold N    Log NEAR-MISS for release→press gaps between
-                        threshold and N ms (default: 100)
+                        threshold and N ms (default: 100). Only used with --debounce.
   --remap SRC=DST       Remap a button to a key, e.g. BTN_EXTRA=KEY_VOLUMEUP.
-                        Remapped buttons bypass debounce. Repeatable.
+                        Remapping is independent of debounce. Repeatable.
   --device PATH         Specific evdev device(s) to filter (default: all mice)
   --lag-threshold N     Log LAG_SPIKE when processing > N ms behind kernel (default: 10)
   --quiet               Suppress per-event logging (SUPPRESSED/NEAR-MISS still log)

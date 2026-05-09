@@ -60,6 +60,7 @@ class TestDelayedDebouncedMouse:
             mouse = debounce_module.DelayedDebouncedMouse(
                 mock_device, threshold_ms,
                 warn_threshold_ms=warn_threshold_ms, quiet=True,
+                debounce_enabled=True,
             )
 
         return mouse, mock_uinput
@@ -299,6 +300,7 @@ class TestHoldAwareDebounce:
             mouse = debounce_module.DelayedDebouncedMouse(
                 mock_device, threshold_ms,
                 hold_threshold_ms=hold_threshold_ms, quiet=True,
+                debounce_enabled=True,
             )
         return mouse, mock_uinput
 
@@ -425,6 +427,7 @@ class TestFlushSynReport:
             mock_uinput_class.from_device.return_value = mock_uinput
             mouse = debounce_module.DelayedDebouncedMouse(
                 mock_device, threshold_ms, quiet=True,
+                debounce_enabled=True,
             )
 
         return mouse, mock_uinput
@@ -537,6 +540,7 @@ class TestButtonRemapping:
             mouse = debounce_module.DelayedDebouncedMouse(
                 mock_device, threshold_ms, quiet=True,
                 button_remap=remap,
+                debounce_enabled=True,
             )
         return mouse, mock_uinput
 
@@ -1302,6 +1306,7 @@ class TestClickDiagnostics:
                 mock_device, threshold_ms,
                 hold_threshold_ms=hold_threshold_ms, quiet=True,
                 diagnose_clicks=diagnose_clicks,
+                debounce_enabled=True,
             )
         return mouse, mock_uinput
 
@@ -1515,6 +1520,7 @@ class TestQuietMode:
             mock_uinput_class.from_device.return_value = mock_uinput
             mouse = debounce_module.DelayedDebouncedMouse(
                 mock_device, threshold_ms, quiet=True,
+                debounce_enabled=True,
             )
         return mouse, mock_uinput
 
@@ -1594,3 +1600,226 @@ class TestQuietMode:
         mouse.flush_pending()
 
         assert mouse.has_notable_events() is False
+
+
+class TestDebounceDisabled:
+    """Tests for the --debounce feature flag (off by default).
+
+    When debounce_enabled=False, the filter still grabs the device and
+    forwards events through uinput (so remapping and lag tracking still
+    work), but skips all bounce-suppression logic: drag releases forward
+    immediately, no pending_release queueing, no SUPPRESSED, no NEAR-MISS.
+    """
+
+    def _make_mouse(self, debounce_module, threshold_ms=60,
+                    hold_threshold_ms=150, remap=None, debounce_enabled=False):
+        from evdev import ecodes
+
+        mock_device = MagicMock()
+        mock_device.name = "Test Mouse"
+        mock_device.fd = 99
+        mock_uinput = MagicMock()
+
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.return_value = mock_uinput
+            mock_uinput_class.from_device.return_value = mock_uinput
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, threshold_ms,
+                hold_threshold_ms=hold_threshold_ms,
+                quiet=True,
+                button_remap=remap,
+                debounce_enabled=debounce_enabled,
+            )
+        return mouse, mock_uinput
+
+    def test_drag_release_forwarded_immediately_when_disabled(self, debounce_module):
+        """With debounce off, a drag release goes straight to uinput."""
+        from evdev import ecodes
+
+        mouse, uinput = self._make_mouse(debounce_module)
+
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)  # 200ms hold = drag
+        uinput.write_event.reset_mock()
+
+        release = make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0)
+        mouse.process_event(release)
+
+        uinput.write_event.assert_called_once_with(release)
+        assert ecodes.BTN_LEFT not in mouse.pending_release
+
+    def test_pending_release_empty_when_disabled(self, debounce_module):
+        """With debounce off, pending_release is never populated."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module)
+
+        # Drag press + release
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+
+        assert mouse.pending_release == {}
+        assert mouse.next_deadline() is None
+
+    def test_classic_bounce_pattern_not_suppressed_when_disabled(self, debounce_module):
+        """With debounce off, drag-release-then-fast-repress is NOT suppressed."""
+        from evdev import ecodes
+
+        mouse, uinput = self._make_mouse(debounce_module, threshold_ms=60)
+
+        # Drag bounce pattern: long hold, release, fast re-press
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        uinput.write_event.reset_mock()
+
+        time.sleep(0.030)  # 30ms gap, well below threshold
+        press2 = make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1)
+        result = mouse.process_event(press2)
+
+        # Re-press should be forwarded, not suppressed
+        assert result is True
+        assert mouse.suppressed == 0
+        uinput.write_event.assert_called_once_with(press2)
+
+    def test_click_release_forwarded_when_disabled(self, debounce_module):
+        """With debounce off, short-hold (click) releases also forward immediately."""
+        from evdev import ecodes
+
+        mouse, uinput = self._make_mouse(debounce_module)
+
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        uinput.write_event.reset_mock()
+
+        release = make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0)
+        mouse.process_event(release)
+
+        uinput.write_event.assert_called_once_with(release)
+        assert ecodes.BTN_LEFT not in mouse.pending_release
+
+    def test_remap_still_works_when_disabled(self, debounce_module):
+        """Remapping is independent of debounce — still active when debounce off."""
+        from evdev import ecodes
+
+        remap = {ecodes.BTN_EXTRA: ecodes.KEY_VOLUMEUP}
+        mouse, uinput = self._make_mouse(debounce_module, remap=remap)
+
+        ev = make_event(ecodes.EV_KEY, ecodes.BTN_EXTRA, 1)
+        result = mouse.process_event(ev)
+
+        assert result is True
+        written = uinput.write_event.call_args_list[-1].args[0]
+        assert written.code == ecodes.KEY_VOLUMEUP
+        assert written.value == 1
+
+    def test_movement_events_pass_through_when_disabled(self, debounce_module):
+        """Movement and other non-button events still flow through with debounce off."""
+        from evdev import ecodes
+
+        mouse, uinput = self._make_mouse(debounce_module)
+
+        ev = make_event(ecodes.EV_REL, ecodes.REL_X, 5)
+        result = mouse.process_event(ev)
+
+        assert result is True
+        uinput.write_event.assert_called_once_with(ev)
+
+    def test_has_notable_events_false_after_bounce_pattern(self, debounce_module):
+        """A bounce pattern with debounce off should not register as notable."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module, threshold_ms=60)
+
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        time.sleep(0.030)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+
+        assert mouse.suppressed == 0
+        assert mouse.has_notable_events() is False
+
+    def test_default_is_disabled(self, debounce_module):
+        """When debounce_enabled is not specified, defaults to off."""
+        from evdev import ecodes
+
+        mock_device = MagicMock()
+        mock_device.name = "Test Mouse"
+        mock_device.fd = 99
+        mock_uinput = MagicMock()
+
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.return_value = mock_uinput
+            mock_uinput_class.from_device.return_value = mock_uinput
+            # No debounce_enabled kwarg
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, 60, quiet=True,
+            )
+
+        # Drag bounce pattern should NOT suppress
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        time.sleep(0.030)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+
+        assert mouse.suppressed == 0
+
+
+class TestDebounceEnabledExplicitly:
+    """Tests that the debounce path still works when explicitly enabled.
+
+    These mirror the historical default-on behavior (now opt-in) to keep
+    the legacy code path covered.
+    """
+
+    def _make_mouse(self, debounce_module, threshold_ms=60,
+                    hold_threshold_ms=150):
+        from evdev import ecodes
+
+        mock_device = MagicMock()
+        mock_device.name = "Test Mouse"
+        mock_device.fd = 99
+        mock_uinput = MagicMock()
+
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.return_value = mock_uinput
+            mock_uinput_class.from_device.return_value = mock_uinput
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, threshold_ms,
+                hold_threshold_ms=hold_threshold_ms,
+                quiet=True,
+                debounce_enabled=True,
+            )
+        return mouse, mock_uinput
+
+    def test_drag_release_queued_when_enabled(self, debounce_module):
+        """With debounce explicitly on, drag releases are queued."""
+        from evdev import ecodes
+
+        mouse, uinput = self._make_mouse(debounce_module)
+
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)
+        uinput.write_event.reset_mock()
+
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+
+        uinput.write_event.assert_not_called()
+        assert ecodes.BTN_LEFT in mouse.pending_release
+
+    def test_bounce_suppressed_when_enabled(self, debounce_module):
+        """With debounce explicitly on, drag bounce is suppressed."""
+        from evdev import ecodes
+
+        mouse, _ = self._make_mouse(debounce_module, threshold_ms=60)
+
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+        time.sleep(0.2)
+        mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 0))
+        time.sleep(0.030)
+        result = mouse.process_event(make_event(ecodes.EV_KEY, ecodes.BTN_LEFT, 1))
+
+        assert result is False
+        assert mouse.suppressed == 1

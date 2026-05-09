@@ -3,8 +3,8 @@
 ## What This Is
 
 A collection of mouse management utilities for Linux, built on evdev. A single `mouse-filter` daemon handles:
-- **Button debounce** — Fixes hardware switch bounce (worn Omron micro-switches) that causes phantom releases during drags and false double-clicks.
 - **Button remapping** — Remaps mouse buttons to keyboard keys (e.g., forward/back → volume up/down). Replaces input-remapper for simple mouse button remaps with zero additional overhead.
+- **Button debounce (opt-in via `--debounce`)** — Suppresses hardware switch bounce (worn Omron micro-switches) that causes phantom releases during drags and false double-clicks. Off by default; the current production mouse hardware does not bounce. The code path is preserved so it can be re-enabled if a future mouse needs it.
 
 ## Architecture
 
@@ -14,7 +14,11 @@ Tools:
 - **`mouse-drag-monitor`** — Diagnostic tool. Monitors raw evdev + X11 focus + BT adapter power state to identify the source of phantom releases. Used during investigation, not in production.
 - **`run.sh`** — Quick-launch wrapper with standard volume remap config. Passes through extra args.
 
-### Debounce Strategy (Drag-Only Delayed Release)
+### Debounce Strategy (Drag-Only Delayed Release) — opt-in
+
+Default: `--debounce` OFF. All releases forward immediately; the filter is effectively a transparent passthrough for buttons (remapping still applies).
+
+When `--debounce` is enabled:
 
 ```
 Drag:     press ─────────[>=150ms]───── release(bounce) ── press(bounce) ──── release(real)
@@ -118,10 +122,10 @@ sudo ./run.sh --diagnose-move --stats-interval 30
 
 ### Run manually
 ```bash
-sudo ./run.sh                          # standard config (debounce + volume remaps)
-sudo ./run.sh --quiet                  # production mode
-sudo ./run.sh --threshold 80           # override threshold
-sudo ./mouse-filter --threshold 70     # direct invocation, no remaps
+sudo ./run.sh                                    # default: remaps only, debounce off
+sudo ./run.sh --quiet                            # production mode
+sudo ./run.sh --debounce --threshold 70          # enable debounce (bouncy hardware)
+sudo ./mouse-filter --debounce --threshold 70    # direct invocation, debounce only
 ```
 
 ### Install as systemd service
