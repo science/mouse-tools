@@ -55,7 +55,7 @@ Configure via `--remap SRC=DST` CLI flag (repeatable).
 | `CLICK_DIAG` | Per-click decision logging (--diagnose-clicks only) | File only (not stdout) |
 | `WHEEL_REV` | Wheel scroll direction reversal — candidate rebound (--diagnose-wheel only) | File only (not stdout) |
 | `WHEEL_BURST_END` | Wheel burst closed out after idle gap (--diagnose-wheel only) | File only (not stdout) |
-| `USER_TAG` | User marker emitted on SIGUSR1 (panel launcher hook). Always emits when received. | Both (also stdout) |
+| `USER_TAG` | User marker emitted on SIGUSR1 (panel launcher hook). Always emits when received. Triggered via `systemctl kill -s SIGUSR1 mouse-filter.service` (auth-free for invoking user via the polkit rule install.sh deploys). | Both (also stdout) |
 | Startup config | Full configuration banner | File only in --quiet; both otherwise |
 
 ### Log File Management

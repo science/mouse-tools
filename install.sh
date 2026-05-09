@@ -4,6 +4,7 @@ set -euo pipefail
 INSTALL_BIN="/usr/local/bin/mouse-filter"
 INSTALL_MONITOR="/usr/local/bin/mouse-drag-monitor"
 SERVICE_FILE="/etc/systemd/system/mouse-filter.service"
+POLKIT_RULE="/etc/polkit-1/rules.d/50-mouse-filter-tag.rules"
 LOG_DIR="/var/log/mouse-filter"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -104,6 +105,35 @@ UNIT
     systemctl start mouse-filter.service
     echo "  Service enabled and started"
 
+    # Polkit rule: allow the invoking user (active console session only) to
+    # send signals to mouse-filter.service via `systemctl kill` without auth.
+    # Used by the ~/bin/mouse-tag launcher to drop USER_TAG markers in the
+    # log without a fingerprint prompt. Scope is intentionally narrow: one
+    # service unit, kill verb, named user, active session.
+    TAG_USER="${SUDO_USER:-${USER:-}}"
+    if [[ -n "$TAG_USER" && "$TAG_USER" != "root" ]]; then
+        mkdir -p "$(dirname "$POLKIT_RULE")"
+        cat > "$POLKIT_RULE" <<RULES
+// Allow $TAG_USER (active console session) to send signals to
+// mouse-filter.service without auth — used by the mouse-tag panel
+// launcher to drop USER_TAG markers in the diagnostic log.
+// Installed by ~/dev/mouse-tools/install.sh
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "mouse-filter.service" &&
+        action.lookup("verb") == "kill" &&
+        subject.user == "$TAG_USER" &&
+        subject.active == true) {
+        return polkit.Result.YES;
+    }
+});
+RULES
+        chmod 644 "$POLKIT_RULE"
+        echo "  Installed $POLKIT_RULE (auth-free SIGUSR1 for $TAG_USER)"
+    else
+        echo "  Skipped polkit rule: SUDO_USER not set or root"
+    fi
+
     echo ""
     echo "Done."
     echo "  Status:  systemctl status mouse-filter.service"
@@ -142,6 +172,11 @@ do_uninstall() {
     if [[ -f "$INSTALL_MONITOR" ]]; then
         rm "$INSTALL_MONITOR"
         echo "  Removed $INSTALL_MONITOR"
+    fi
+
+    if [[ -f "$POLKIT_RULE" ]]; then
+        rm "$POLKIT_RULE"
+        echo "  Removed $POLKIT_RULE"
     fi
 
     echo ""

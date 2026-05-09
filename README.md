@@ -122,7 +122,11 @@ Events are logged to `~/.local/share/mouse-filter/debounce.log` (uses `$SUDO_USE
 | `MOVE_DIAG` | Movement pipeline breakdown with per-stage latency (only with `--diagnose-move`). |
 | `WHEEL_REV` | Wheel scroll direction reversal — candidate rebound. Logs prev burst sum/count and reversal value/gap (only with `--diagnose-wheel`, file-only). |
 | `WHEEL_BURST_END` | A wheel scroll burst closed out after an idle gap. Summarizes total / count / duration (only with `--diagnose-wheel`, file-only). |
-| `USER_TAG` | User-pressed marker (SIGUSR1). Use to bookmark moments when a UX glitch was perceived, so the surrounding log lines can be inspected. Send with `pkill -USR1 -f mouse-filter` or via the `mouse-tag` panel launcher. |
+| `USER_TAG` | User-pressed marker (SIGUSR1). Use to bookmark moments when a UX glitch was perceived, so the surrounding log lines can be inspected. Send via `systemctl kill -s SIGUSR1 mouse-filter.service` or the `mouse-tag` panel launcher. |
+
+### Auth-free tagging (polkit rule)
+
+`install.sh` writes a narrow polkit rule at `/etc/polkit-1/rules.d/50-mouse-filter-tag.rules` that allows the invoking user (`$SUDO_USER`) to send signals to `mouse-filter.service` without an auth prompt — but only when in an active console session, only on this one service, only for the `kill` verb. This makes the panel-launcher tagging click frictionless without expanding any group memberships. Removed by `install.sh --uninstall`.
 
 Fast double-clicks (short hold < 150ms followed by fast re-press) are silently allowed through without logging — they're normal user behavior, not bounces.
 
