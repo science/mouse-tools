@@ -65,6 +65,14 @@ def log(msg, also_print=True):
         print(line, flush=True)
 
 
+def log_user_tag(label="marker"):
+    """Emit a USER_TAG line to the log. Triggered by SIGUSR1 from a
+    panel-launcher script when the user perceives a UX glitch and wants
+    to mark its location in the log for later analysis.
+    """
+    log(f"USER_TAG: {label}")
+
+
 def find_mice():
     """Find all physical mouse evdev devices (skip virtual/forwarded)."""
     mice = []
@@ -392,6 +400,140 @@ class X11PointerProbe:
             self._thread.join(timeout=1.0)
 
 
+class WheelDiagnostics:
+    """Wheel-event burst classifier and reversal logger.
+
+    Read-only diagnostic. Each wheel event (REL_WHEEL or REL_WHEEL_HI_RES) is
+    classified into a directional burst. State machine:
+
+      idle/unseeded → first event seeds {dir, sum, count, start_mono}
+      same-dir event → extend burst
+      sign-flip event → emit WHEEL_REV(prev_burst_summary, reversal_event),
+                        then seed a new burst rooted at the reverse event
+      idle gap > idle_ms before next event → emit WHEEL_BURST_END(prev_burst),
+                                              then seed new burst at this event
+
+    Counters: burst_count tracks total observed wheel events (across all
+    bursts) for tests / sanity checks. burst_id increments per closed-out
+    or reversed burst so reversal log lines are uniquely identifiable.
+
+    All log lines use also_print=False — file-only, like --diagnose-clicks.
+    """
+
+    WHEEL_CODES = {ecodes.REL_WHEEL, ecodes.REL_WHEEL_HI_RES}
+
+    def __init__(self, name, idle_ms=250):
+        self.name = name
+        self.idle_s = idle_ms / 1000.0
+        self.burst_count = 0  # total wheel events observed
+        self._burst_id_seq = 0
+        # Active burst state
+        self._dir = 0           # +1 / -1 / 0 (unseeded)
+        self._sum = 0           # signed sum of values in current burst
+        self._count = 0         # event count in current burst
+        self._start_mono = None
+        self._last_mono = None
+        self._axes_seen = set()  # which REL_* codes contributed
+        self._burst_id = None    # id of the current burst
+
+    def observe(self, event, now_mono):
+        """Process one event. Caller must filter to wheel events.
+
+        Caller passes now_mono (time.monotonic()) so tests can drive
+        deterministic timing without time.sleep.
+        """
+        if event.code not in self.WHEEL_CODES:
+            return
+        self.burst_count += 1
+        value = event.value
+        if value == 0:
+            # Zero-value events have no direction; ignore without disturbing state
+            return
+
+        sign = 1 if value > 0 else -1
+
+        # Idle close-out before classifying this event
+        if (self._dir != 0 and self._last_mono is not None
+                and (now_mono - self._last_mono) > self.idle_s):
+            self._emit_burst_end()
+            self._reset_burst()
+
+        if self._dir == 0:
+            self._seed_burst(sign, value, event.code, now_mono)
+            return
+
+        if sign == self._dir:
+            self._sum += value
+            self._count += 1
+            self._last_mono = now_mono
+            self._axes_seen.add(event.code)
+            return
+
+        # Sign flip — emit reversal log, then start a new burst at this event
+        self._emit_reversal(value, event.code, now_mono)
+        self._reset_burst()
+        self._seed_burst(sign, value, event.code, now_mono)
+
+    def _seed_burst(self, sign, value, code, now_mono):
+        self._burst_id_seq += 1
+        self._burst_id = self._burst_id_seq
+        self._dir = sign
+        self._sum = value
+        self._count = 1
+        self._start_mono = now_mono
+        self._last_mono = now_mono
+        self._axes_seen = {code}
+
+    def _reset_burst(self):
+        self._dir = 0
+        self._sum = 0
+        self._count = 0
+        self._start_mono = None
+        self._last_mono = None
+        self._axes_seen = set()
+        self._burst_id = None
+
+    def _axis_label(self):
+        if not self._axes_seen:
+            return "none"
+        labels = []
+        if ecodes.REL_WHEEL in self._axes_seen:
+            labels.append("WHEEL")
+        if ecodes.REL_WHEEL_HI_RES in self._axes_seen:
+            labels.append("HI_RES")
+        return "+".join(labels) if labels else "none"
+
+    def _dir_word(self, sign):
+        return "down" if sign < 0 else "up"
+
+    def _emit_reversal(self, rev_value, rev_code, now_mono):
+        gap_ms = int(round((now_mono - self._last_mono) * 1000))
+        since_start_ms = int(round((now_mono - self._start_mono) * 1000))
+        rev_axis = "HI_RES" if rev_code == ecodes.REL_WHEEL_HI_RES else "WHEEL"
+        log(f"WHEEL_REV on {self.name}: burst_id={self._burst_id} "
+            f"axis={self._axis_label()} "
+            f"flip={self._dir_word(self._dir)}->{self._dir_word(1 if rev_value > 0 else -1)} "
+            f"prev(sum={self._sum} count={self._count}) "
+            f"rev(axis={rev_axis} value={'+' if rev_value > 0 else ''}{rev_value} "
+            f"gap_ms={gap_ms}) "
+            f"since_burst_start_ms={since_start_ms}",
+            also_print=False)
+
+    def _emit_burst_end(self):
+        dur_ms = int(round((self._last_mono - self._start_mono) * 1000))
+        log(f"WHEEL_BURST_END on {self.name}: burst_id={self._burst_id} "
+            f"dir={self._dir_word(self._dir)} "
+            f"axis={self._axis_label()} "
+            f"sum={self._sum} count={self._count} dur_ms={dur_ms}",
+            also_print=False)
+
+    def flush(self):
+        """Close out any active burst (e.g., on shutdown)."""
+        if self._dir != 0:
+            self._emit_burst_end()
+            self._reset_burst()
+
+
 class DebouncedMouse:
     """Wraps a single mouse device with debounce filtering."""
 
@@ -482,7 +624,7 @@ class DelayedDebouncedMouse:
     def __init__(self, device, threshold_ms, warn_threshold_ms=None,
                  hold_threshold_ms=None, quiet=False, lag_threshold_ms=10,
                  button_remap=None, diagnose_move=False, diagnose_clicks=False,
-                 debounce_enabled=False):
+                 debounce_enabled=False, diagnose_wheel=False):
         self.device = device
         self.threshold_s = threshold_ms / 1000.0
         self.button_remap = button_remap or {}  # {src_code: dst_code}
@@ -517,6 +659,8 @@ class DelayedDebouncedMouse:
 
         # Movement diagnostics (only when --diagnose-move is active)
         self._move_diag = MoveDiagnostics(lag_threshold_ms=lag_threshold_ms) if diagnose_move else None
+        # Wheel diagnostics (only when --diagnose-wheel is active)
+        self._wheel_diag = WheelDiagnostics(name=device.name) if diagnose_wheel else None
 
         # Build uinput device. If we have remaps, add target key codes to
         # the capabilities — the physical mouse doesn't advertise KEY_VOLUMEUP etc,
@@ -574,6 +718,11 @@ class DelayedDebouncedMouse:
         is_movement = event.type == ecodes.EV_REL
         if self._move_diag and is_movement:
             self._move_diag.record_input(lag_ms)
+
+        # Record wheel events in diagnostics (read-only — never mutates stream)
+        if (self._wheel_diag and event.type == ecodes.EV_REL
+                and event.code in WheelDiagnostics.WHEEL_CODES):
+            self._wheel_diag.observe(event, now)
 
         # Button remapping: transform code and forward immediately (no debounce)
         if event.type == ecodes.EV_KEY and event.code in self.button_remap:
@@ -709,6 +858,9 @@ class DelayedDebouncedMouse:
         for btn, (event, ts, _) in self.pending_release.items():
             self.uinput.write_event(event)
         self.pending_release.clear()
+        # Flush any open wheel burst so its summary is captured
+        if self._wheel_diag:
+            self._wheel_diag.flush()
         try:
             self.device.ungrab()
         except Exception:
@@ -769,6 +921,12 @@ def main():
                              "When enabled, drag releases are delayed by --threshold ms "
                              "and bounced re-presses within that window are suppressed; "
                              "click releases are unaffected.")
+    parser.add_argument("--diagnose-wheel", action="store_true",
+                        help="Log wheel-event diagnostics to log file (not stdout). "
+                             "Classifies REL_WHEEL/REL_WHEEL_HI_RES events into "
+                             "directional bursts and logs WHEEL_REV on sign flips and "
+                             "WHEEL_BURST_END on idle close-out. Read-only — never "
+                             "mutates the forwarded event stream.")
     args = parser.parse_args()
 
     # Parse button remaps
@@ -822,7 +980,8 @@ def main():
                                        button_remap=button_remap,
                                        diagnose_move=args.diagnose_move,
                                        diagnose_clicks=args.diagnose_clicks,
-                                       debounce_enabled=args.debounce)
+                                       debounce_enabled=args.debounce,
+                                       diagnose_wheel=args.diagnose_wheel)
             mice.append(dm)
             log(f"Filtering: {dev.name} ({dev.path}) -> {dm.uinput.name}")
         except Exception as e:
@@ -880,6 +1039,8 @@ def main():
         log(f"  Move diagnostics:  ENABLED (reports at each stats interval)")
     if args.diagnose_clicks:
         log(f"  Click diagnostics: ENABLED (logging to {LOG_FILE})")
+    if args.diagnose_wheel:
+        log(f"  Wheel diagnostics: ENABLED (logging to {LOG_FILE})")
 
     running = True
 
@@ -889,6 +1050,11 @@ def main():
 
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
+
+    def handle_user_tag(sig, frame):
+        log_user_tag()
+
+    signal.signal(signal.SIGUSR1, handle_user_tag)
 
     # Build fd -> mouse mapping for select()
     fd_map = {m.device.fd: m for m in mice}
@@ -977,7 +1143,8 @@ def main():
                         button_remap=button_remap,
                         diagnose_move=args.diagnose_move,
                         diagnose_clicks=args.diagnose_clicks,
-                        debounce_enabled=args.debounce)
+                        debounce_enabled=args.debounce,
+                        diagnose_wheel=args.diagnose_wheel)
                     mice.append(dm)
                     fd_map[dm.device.fd] = dm
                     active_paths.add(dev.path)

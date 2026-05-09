@@ -78,7 +78,9 @@ After=multi-user.target
 Type=simple
 # Debounce is OFF by default. To re-enable for bouncy hardware,
 # append: --debounce --threshold 70
-ExecStart=$INSTALL_BIN --quiet --log-dir $LOG_DIR --remap BTN_EXTRA=KEY_VOLUMEUP --remap BTN_SIDE=KEY_VOLUMEDOWN --remap BTN_MIDDLE=KEY_MUTE
+# --diagnose-wheel logs WHEEL_REV / WHEEL_BURST_END to debounce.log for
+# rebound characterization on the smooth-scroll MX 2.
+ExecStart=$INSTALL_BIN --quiet --diagnose-wheel --log-dir $LOG_DIR --remap BTN_EXTRA=KEY_VOLUMEUP --remap BTN_SIDE=KEY_VOLUMEDOWN --remap BTN_MIDDLE=KEY_MUTE
 Restart=on-failure
 RestartSec=3
 

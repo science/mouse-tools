@@ -53,6 +53,9 @@ Configure via `--remap SRC=DST` CLI flag (repeatable).
 | `STATS` | Periodic summary (clicks, suppressions, lag) | Only when notable events occurred |
 | `MOVE_DIAG` | Per-stage movement latency breakdown (--diagnose-move only) | Only when non-CLEAN |
 | `CLICK_DIAG` | Per-click decision logging (--diagnose-clicks only) | File only (not stdout) |
+| `WHEEL_REV` | Wheel scroll direction reversal — candidate rebound (--diagnose-wheel only) | File only (not stdout) |
+| `WHEEL_BURST_END` | Wheel burst closed out after idle gap (--diagnose-wheel only) | File only (not stdout) |
+| `USER_TAG` | User marker emitted on SIGUSR1 (panel launcher hook). Always emits when received. | Both (also stdout) |
 | Startup config | Full configuration banner | File only in --quiet; both otherwise |
 
 ### Log File Management
@@ -83,6 +86,7 @@ The log file (`~/.local/share/mouse-filter/debounce.log` or `--log-dir`) is capp
 
 - **`DelayedDebouncedMouse`** — The production implementation. Handles remapping, immediate click releases, delayed drag releases, bounce suppression. This is the one that matters.
 - **`MoveDiagnostics`** — Per-interval movement pipeline telemetry. Tracks 4 stages: input delivery lag/Hz, batch sizes, loop iteration time, uinput write latency. Also holds `x11_stalls` counter written by X11PointerProbe. Created per-mouse only when `--diagnose-move` is active.
+- **`WheelDiagnostics`** — Wheel-event burst classifier and reversal logger. Per-mouse state machine that groups REL_WHEEL/REL_WHEEL_HI_RES events into directional bursts; emits `WHEEL_REV` on sign-flip events and `WHEEL_BURST_END` on idle close-out. Read-only; never modifies the forwarded event stream. Created per-mouse only when `--diagnose-wheel` is active. Built to characterize wheel rebound on smooth-scroll wheels (e.g., Logitech MX Master / MX 2) before deciding on a suppression policy.
 - **`X11PointerProbe`** — Daemon thread polling `XQueryPointer` at 200Hz to detect downstream pointer stalls. If events are forwarded but the pointer hasn't moved for 50ms, logs an `x11_stall`. Gracefully degrades when `$DISPLAY` unavailable.
 - **`DebouncedMouse`** — Earlier approach (suppress on re-press, no release delay). Kept for reference but not used. Can be removed.
 - **`FocusMonitor`** (in drag-monitor) — Watches `_NET_ACTIVE_WINDOW` via xprop.

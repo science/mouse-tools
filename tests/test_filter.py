@@ -1823,3 +1823,294 @@ class TestDebounceEnabledExplicitly:
 
         assert result is False
         assert mouse.suppressed == 1
+
+
+def make_wheel_event(code, value):
+    """Create a mock REL_* wheel event."""
+    from evdev import ecodes
+    ev = MagicMock()
+    ev.type = ecodes.EV_REL
+    ev.code = code
+    ev.value = value
+    now = time.time()
+    ev.sec = int(now)
+    ev.usec = int((now - int(now)) * 1_000_000)
+    return ev
+
+
+class TestWheelDiagnostics:
+    """Tests for WheelDiagnostics — wheel-event burst classifier and reversal logger.
+
+    Captures REL_WHEEL / REL_WHEEL_HI_RES events into directional bursts.
+    Emits WHEEL_REV when the sign flips (candidate rebound) and WHEEL_BURST_END
+    when an idle gap closes out the previous burst. Read-only — never mutates
+    the forwarded event stream.
+    """
+
+    def _make_diag(self, debounce_module, name="Test Mouse", idle_ms=250):
+        return debounce_module.WheelDiagnostics(name=name, idle_ms=idle_ms)
+
+    def test_single_direction_burst_emits_no_reversal(self, debounce_module):
+        from evdev import ecodes
+        diag = self._make_diag(debounce_module)
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            for i in range(5):
+                diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120),
+                             now_mono=1.0 + i * 0.020)
+
+        rev_calls = [c for c in mock_log.call_args_list if 'WHEEL_REV' in str(c)]
+        assert len(rev_calls) == 0
+
+    def test_sign_flip_emits_wheel_rev(self, debounce_module):
+        """A reverse event after a same-direction burst emits WHEEL_REV."""
+        from evdev import ecodes
+        diag = self._make_diag(debounce_module)
+
+        # Down burst
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.000)
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.020)
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.040)
+
+        # Reversal
+        with patch.object(debounce_module, 'log') as mock_log:
+            diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +24),
+                         now_mono=1.080)
+
+        rev_calls = [c for c in mock_log.call_args_list if 'WHEEL_REV' in str(c)]
+        assert len(rev_calls) == 1
+        msg = rev_calls[0].args[0]
+        # Sanity: contains key fields
+        assert 'WHEEL_REV' in msg
+        assert 'value=24' in msg or '+24' in msg
+        # Previous burst summary
+        assert 'sum=-360' in msg
+        assert 'count=3' in msg
+        # All wheel logs are file-only
+        assert rev_calls[0].kwargs.get('also_print') is False
+
+    def test_reversal_starts_new_burst_at_reverse_event(self, debounce_module):
+        """After WHEEL_REV, the reverse event seeds a new burst — no second
+        WHEEL_REV when more same-direction events follow."""
+        from evdev import ecodes
+        diag = self._make_diag(debounce_module)
+
+        # Down burst
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.000)
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.020)
+        # First reversal
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +24), now_mono=1.040)
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            # More up events — same direction as the new burst, no new WHEEL_REV
+            diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +24),
+                         now_mono=1.060)
+            diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +24),
+                         now_mono=1.080)
+
+        rev_calls = [c for c in mock_log.call_args_list if 'WHEEL_REV' in str(c)]
+        assert len(rev_calls) == 0
+
+    def test_two_consecutive_reversals_get_distinct_burst_ids(self, debounce_module):
+        """Down → up → down emits two reversal entries with different burst_ids."""
+        from evdev import ecodes
+        diag = self._make_diag(debounce_module)
+
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.000)
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.020)
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            # Reversal 1: up
+            diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +24),
+                         now_mono=1.050)
+            # Reversal 2: down
+            diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120),
+                         now_mono=1.080)
+
+        rev_calls = [c for c in mock_log.call_args_list if 'WHEEL_REV' in str(c)]
+        assert len(rev_calls) == 2
+        msg1 = rev_calls[0].args[0]
+        msg2 = rev_calls[1].args[0]
+        # Two distinct burst_ids
+        import re
+        ids = [re.search(r'burst_id=(\d+)', m) for m in (msg1, msg2)]
+        assert all(ids), f"both messages should have burst_id: {msg1!r}, {msg2!r}"
+        assert ids[0].group(1) != ids[1].group(1)
+
+    def test_idle_gap_emits_burst_end_no_reversal(self, debounce_module):
+        """An idle gap > idle_ms before a same-direction event closes out the
+        previous burst with WHEEL_BURST_END (no WHEEL_REV)."""
+        from evdev import ecodes
+        diag = self._make_diag(debounce_module, idle_ms=250)
+
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.000)
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.020)
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            # 500ms gap — burst should close out
+            diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120),
+                         now_mono=1.520)
+
+        rev_calls = [c for c in mock_log.call_args_list if 'WHEEL_REV' in str(c)]
+        end_calls = [c for c in mock_log.call_args_list if 'WHEEL_BURST_END' in str(c)]
+        assert len(rev_calls) == 0
+        assert len(end_calls) == 1
+        msg = end_calls[0].args[0]
+        assert 'sum=-240' in msg
+        assert 'count=2' in msg
+        assert end_calls[0].kwargs.get('also_print') is False
+
+    def test_mixed_axis_same_direction_is_single_burst(self, debounce_module):
+        """REL_WHEEL and REL_WHEEL_HI_RES same-direction events form one burst."""
+        from evdev import ecodes
+        diag = self._make_diag(debounce_module)
+
+        # Hi-res chunks plus a notch crossing — all same direction
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -60), now_mono=1.000)
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -60), now_mono=1.005)
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL, -1), now_mono=1.005)
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            # Reversal
+            diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +24),
+                         now_mono=1.040)
+
+        rev_calls = [c for c in mock_log.call_args_list if 'WHEEL_REV' in str(c)]
+        assert len(rev_calls) == 1
+        msg = rev_calls[0].args[0]
+        # Hi-res sum: -60 + -60 = -120; notch sum: -1
+        assert 'count=3' in msg
+        # Should mention both axes saw activity
+        assert 'WHEEL' in msg
+
+    def test_zero_value_event_ignored(self, debounce_module):
+        """A zero-value wheel event (shouldn't normally happen) doesn't break state."""
+        from evdev import ecodes
+        diag = self._make_diag(debounce_module)
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, 0),
+                         now_mono=1.000)
+
+        # Should not emit anything and not crash
+        rev_calls = [c for c in mock_log.call_args_list if 'WHEEL_REV' in str(c)]
+        end_calls = [c for c in mock_log.call_args_list if 'WHEEL_BURST_END' in str(c)]
+        assert len(rev_calls) == 0
+        assert len(end_calls) == 0
+
+    def test_reversal_records_gap_and_since_burst_start(self, debounce_module):
+        """WHEEL_REV records gap_ms (last forward event → reversal) and
+        since_burst_start_ms (burst start → reversal)."""
+        from evdev import ecodes
+        diag = self._make_diag(debounce_module)
+
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.000)
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.040)
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            # Gap from last forward (1.040) to reversal: 60ms
+            # Since burst start (1.000): 100ms
+            diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +24),
+                         now_mono=1.100)
+
+        rev_calls = [c for c in mock_log.call_args_list if 'WHEEL_REV' in str(c)]
+        assert len(rev_calls) == 1
+        msg = rev_calls[0].args[0]
+        assert 'gap_ms=60' in msg
+        assert 'since_burst_start_ms=100' in msg
+
+
+class TestWheelDiagnosticsIntegration:
+    """Tests for --diagnose-wheel hooks in DelayedDebouncedMouse."""
+
+    def _make_mouse(self, debounce_module, threshold_ms=60, diagnose_wheel=True):
+        from evdev import ecodes
+        mock_device = MagicMock()
+        mock_device.name = "Test Mouse"
+        mock_device.fd = 99
+        mock_uinput = MagicMock()
+
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.from_device.return_value = mock_uinput
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, threshold_ms, quiet=True,
+                diagnose_wheel=diagnose_wheel,
+            )
+        return mouse, mock_uinput
+
+    def test_wheel_diag_created_when_enabled(self, debounce_module):
+        mouse, _ = self._make_mouse(debounce_module, diagnose_wheel=True)
+        assert isinstance(mouse._wheel_diag, debounce_module.WheelDiagnostics)
+
+    def test_wheel_diag_not_created_by_default(self, debounce_module):
+        mouse, _ = self._make_mouse(debounce_module, diagnose_wheel=False)
+        assert mouse._wheel_diag is None
+
+    def test_wheel_event_routed_to_diag(self, debounce_module):
+        """A REL_WHEEL_HI_RES event should be observed by the diag instance."""
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module)
+
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120)
+        result = mouse.process_event(ev)
+
+        # Forwarded normally
+        assert result is True
+        uinput.write_event.assert_called_once_with(ev)
+        # Recorded in diag
+        assert mouse._wheel_diag.burst_count == 1
+
+    def test_rel_wheel_also_routed(self, debounce_module):
+        """REL_WHEEL events (notch axis) should also be observed."""
+        from evdev import ecodes
+        mouse, _ = self._make_mouse(debounce_module)
+
+        ev = make_wheel_event(ecodes.REL_WHEEL, -1)
+        mouse.process_event(ev)
+
+        assert mouse._wheel_diag.burst_count == 1
+
+    def test_rel_x_not_routed_as_wheel(self, debounce_module):
+        """Movement events (REL_X / REL_Y) must NOT be classified as wheel."""
+        from evdev import ecodes
+        mouse, _ = self._make_mouse(debounce_module)
+
+        mouse.process_event(make_wheel_event(ecodes.REL_X, 5))
+        mouse.process_event(make_wheel_event(ecodes.REL_Y, -3))
+
+        assert mouse._wheel_diag.burst_count == 0
+
+    def test_no_diag_calls_when_disabled(self, debounce_module):
+        """With diagnose_wheel=False, no WHEEL_REV / WHEEL_BURST_END logs."""
+        from evdev import ecodes
+        mouse, _ = self._make_mouse(debounce_module, diagnose_wheel=False)
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            # Down burst then reversal — would normally log WHEEL_REV
+            mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +24))
+
+        diag_calls = [c for c in mock_log.call_args_list
+                      if 'WHEEL_REV' in str(c) or 'WHEEL_BURST_END' in str(c)]
+        assert len(diag_calls) == 0
+
+
+class TestUserTag:
+    """Tests for the SIGUSR1 USER_TAG mechanism (panel-launcher hook)."""
+
+    def test_log_user_tag_default_label(self, debounce_module):
+        with patch.object(debounce_module, 'log') as mock_log:
+            debounce_module.log_user_tag()
+
+        assert mock_log.call_count == 1
+        msg = mock_log.call_args.args[0]
+        assert msg.startswith("USER_TAG: ")
+        assert "marker" in msg
+
+    def test_log_user_tag_custom_label(self, debounce_module):
+        with patch.object(debounce_module, 'log') as mock_log:
+            debounce_module.log_user_tag("rebound-felt")
+
+        msg = mock_log.call_args.args[0]
+        assert msg == "USER_TAG: rebound-felt"

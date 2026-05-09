@@ -104,6 +104,10 @@ Options:
   --stats-interval N    Print stats every N seconds (default: 600)
   --log-dir PATH        Directory for log files
   --diagnose-move       Enable movement pipeline diagnostics (see below)
+  --diagnose-wheel      Log wheel-event burst classification + sign-flip
+                        reversals to the log file. Use to characterize
+                        wheel-rebound behavior on smooth-scroll wheels
+                        before deciding on a suppression policy.
 ```
 
 ## Logging
@@ -116,6 +120,9 @@ Events are logged to `~/.local/share/mouse-filter/debounce.log` (uses `$SUDO_USE
 | `NEAR-MISS` | Release→re-press gap was between threshold and warn-threshold, after a drag hold. The filter didn't catch it. Consider raising `--threshold`. Always logged. |
 | `STATS` | Periodic summary: total clicks, suppressions, events processed, lag spikes, max lag per device. |
 | `MOVE_DIAG` | Movement pipeline breakdown with per-stage latency (only with `--diagnose-move`). |
+| `WHEEL_REV` | Wheel scroll direction reversal — candidate rebound. Logs prev burst sum/count and reversal value/gap (only with `--diagnose-wheel`, file-only). |
+| `WHEEL_BURST_END` | A wheel scroll burst closed out after an idle gap. Summarizes total / count / duration (only with `--diagnose-wheel`, file-only). |
+| `USER_TAG` | User-pressed marker (SIGUSR1). Use to bookmark moments when a UX glitch was perceived, so the surrounding log lines can be inspected. Send with `pkill -USR1 -f mouse-filter` or via the `mouse-tag` panel launcher. |
 
 Fast double-clicks (short hold < 150ms followed by fast re-press) are silently allowed through without logging — they're normal user behavior, not bounces.
 
