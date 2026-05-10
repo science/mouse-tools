@@ -79,9 +79,16 @@ After=multi-user.target
 Type=simple
 # Debounce is OFF by default. To re-enable for bouncy hardware,
 # append: --debounce --threshold 70
-# --diagnose-wheel logs WHEEL_REV / WHEEL_BURST_END to debounce.log for
-# rebound characterization on the smooth-scroll MX 2.
-ExecStart=$INSTALL_BIN --quiet --diagnose-wheel --log-dir $LOG_DIR --remap BTN_EXTRA=KEY_VOLUMEUP --remap BTN_SIDE=KEY_VOLUMEDOWN --remap BTN_MIDDLE=KEY_MUTE
+# Wheel suppression has been DISABLED in favor of the Solaar
+# "Scroll Wheel Resolution OFF" hardware setting — that change makes
+# the wheel ignore sub-detent free-spin bounces at the firmware level,
+# eliminating the artifacts that --wheel-suppress was filtering. The
+# code paths remain available; to re-enable add --wheel-suppress (and
+# optionally --wheel-type-b) below.
+# --wheel-multiplier 3 compensates for the lost smooth-scroll velocity
+# in low-res mode. --diagnose-wheel keeps WHEEL_REV / WHEEL_BURST_END
+# logging for ongoing visibility into wheel behavior.
+ExecStart=$INSTALL_BIN --quiet --wheel-multiplier 3 --diagnose-wheel --log-dir $LOG_DIR --remap BTN_EXTRA=KEY_VOLUMEUP --remap BTN_SIDE=KEY_VOLUMEDOWN --remap BTN_MIDDLE=KEY_MUTE
 Restart=on-failure
 RestartSec=3
 
@@ -102,14 +109,17 @@ UNIT
 
     systemctl daemon-reload
     systemctl enable mouse-filter.service
-    systemctl start mouse-filter.service
-    echo "  Service enabled and started"
+    # Use restart so an already-running service picks up the new ExecStart;
+    # `start` is a no-op when active and would silently leave stale args.
+    systemctl restart mouse-filter.service
+    echo "  Service enabled and (re)started"
 
     # Polkit rule: allow the invoking user (active console session only) to
     # send signals to mouse-filter.service via `systemctl kill` without auth.
-    # Used by the ~/bin/mouse-tag launcher to drop USER_TAG markers in the
-    # log without a fingerprint prompt. Scope is intentionally narrow: one
-    # service unit, kill verb, named user, active session.
+    # The rule's `verb == "kill"` clause is signal-agnostic — it covers
+    # SIGUSR1 (mouse-tag → USER_TAG marker) and SIGUSR2 (mouse-suppress →
+    # WHEEL_SUPPRESS_TOGGLE) with the same single rule. Scope is intentionally
+    # narrow: one service unit, kill verb, named user, active session.
     TAG_USER="${SUDO_USER:-${USER:-}}"
     if [[ -n "$TAG_USER" && "$TAG_USER" != "root" ]]; then
         mkdir -p "$(dirname "$POLKIT_RULE")"

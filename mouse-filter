@@ -422,11 +422,18 @@ class WheelDiagnostics:
 
     WHEEL_CODES = {ecodes.REL_WHEEL, ecodes.REL_WHEEL_HI_RES}
 
-    def __init__(self, name, idle_ms=250):
+    def __init__(self, name, idle_ms=250, on_burst_closed=None, emit_logs=True):
         self.name = name
         self.idle_s = idle_ms / 1000.0
         self.burst_count = 0  # total wheel events observed
         self._burst_id_seq = 0
+        # When False, WHEEL_REV / WHEEL_BURST_END are not logged. State machine
+        # still runs and on_burst_closed still fires — used by WheelSuppressor
+        # to drive its anchor without polluting the log.
+        self.emit_logs = emit_logs
+        # Optional callback fired on every burst close (idle, reversal, flush).
+        # Signature: (signed_dir, abs_sum, end_mono).
+        self.on_burst_closed = on_burst_closed
         # Active burst state
         self._dir = 0           # +1 / -1 / 0 (unseeded)
         self._sum = 0           # signed sum of values in current burst
@@ -507,31 +514,267 @@ class WheelDiagnostics:
         return "down" if sign < 0 else "up"
 
     def _emit_reversal(self, rev_value, rev_code, now_mono):
-        gap_ms = int(round((now_mono - self._last_mono) * 1000))
-        since_start_ms = int(round((now_mono - self._start_mono) * 1000))
-        rev_axis = "HI_RES" if rev_code == ecodes.REL_WHEEL_HI_RES else "WHEEL"
-        log(f"WHEEL_REV on {self.name}: burst_id={self._burst_id} "
-            f"axis={self._axis_label()} "
-            f"flip={self._dir_word(self._dir)}->{self._dir_word(1 if rev_value > 0 else -1)} "
-            f"prev(sum={self._sum} count={self._count}) "
-            f"rev(axis={rev_axis} value={'+' if rev_value > 0 else ''}{rev_value} "
-            f"gap_ms={gap_ms}) "
-            f"since_burst_start_ms={since_start_ms}",
-            also_print=False)
+        if self.emit_logs:
+            gap_ms = int(round((now_mono - self._last_mono) * 1000))
+            since_start_ms = int(round((now_mono - self._start_mono) * 1000))
+            rev_axis = "HI_RES" if rev_code == ecodes.REL_WHEEL_HI_RES else "WHEEL"
+            log(f"WHEEL_REV on {self.name}: burst_id={self._burst_id} "
+                f"axis={self._axis_label()} "
+                f"flip={self._dir_word(self._dir)}->{self._dir_word(1 if rev_value > 0 else -1)} "
+                f"prev(sum={self._sum} count={self._count}) "
+                f"rev(axis={rev_axis} value={'+' if rev_value > 0 else ''}{rev_value} "
+                f"gap_ms={gap_ms}) "
+                f"since_burst_start_ms={since_start_ms}",
+                also_print=False)
+        if self.on_burst_closed is not None:
+            self.on_burst_closed(self._dir, abs(self._sum), self._last_mono)
 
     def _emit_burst_end(self):
-        dur_ms = int(round((self._last_mono - self._start_mono) * 1000))
-        log(f"WHEEL_BURST_END on {self.name}: burst_id={self._burst_id} "
-            f"dir={self._dir_word(self._dir)} "
-            f"axis={self._axis_label()} "
-            f"sum={self._sum} count={self._count} dur_ms={dur_ms}",
-            also_print=False)
+        if self.emit_logs:
+            dur_ms = int(round((self._last_mono - self._start_mono) * 1000))
+            log(f"WHEEL_BURST_END on {self.name}: burst_id={self._burst_id} "
+                f"dir={self._dir_word(self._dir)} "
+                f"axis={self._axis_label()} "
+                f"sum={self._sum} count={self._count} dur_ms={dur_ms}",
+                also_print=False)
+        if self.on_burst_closed is not None:
+            self.on_burst_closed(self._dir, abs(self._sum), self._last_mono)
 
     def flush(self):
         """Close out any active burst (e.g., on shutdown)."""
         if self._dir != 0:
             self._emit_burst_end()
             self._reset_burst()
+
+
+class _ClosedBurst:
+    """Anchor record for the most recent closed wheel burst.
+
+    Used by WheelSuppressor to compute Type A / Type B suppression decisions.
+    Mutable on purpose — cascade-extension updates end_mono in place.
+    `type_a_consumed` ensures Type A fires at most ONCE per anchor — a real
+    reverse scroll has many opposite-direction events; suppressing all of
+    them would block legitimate scrolls indefinitely. After the first
+    Type A suppression on an anchor, subsequent opposite-direction events
+    fall through.
+    """
+    __slots__ = ("dir", "abs_sum", "end_mono", "was_significant",
+                 "type_a_consumed")
+
+    def __init__(self, dir_, abs_sum, end_mono, was_significant):
+        self.dir = dir_
+        self.abs_sum = abs_sum
+        self.end_mono = end_mono
+        self.was_significant = was_significant
+        self.type_a_consumed = False
+
+
+class WheelSuppressor:
+    """Active wheel-bounce suppression filter.
+
+    Drops hardware-rebound events on smooth-scroll wheels (e.g. Logitech
+    MX 2 with detents disabled). Two suppression rules:
+
+      Type A — single-step opposite-direction event arriving within
+               REV_WINDOW_MS of a significant primary's end. Captures the
+               kinetic backswing pulse seen in WHEEL_REV log entries.
+
+      Type B — same-direction re-burst within COOLDOWN_MS of a significant
+               primary's end, magnitude-bounded by min(primary*ratio,
+               bounce_max_total). Captures residual-momentum forward kicks.
+
+    Anchor is set / refreshed by WheelDiagnostics via on_burst_closed
+    callback. Cascade chains (each sub-burst < ½ previous) are caught by
+    extending the anchor's end_mono on same-direction small-burst closures
+    while preserving the original primary's magnitude as the budget
+    reference. Cross-direction small closures clear the anchor — user
+    reversed legitimately.
+
+    Hot-path cost: a few comparisons and integer arithmetic. No allocations,
+    no I/O. The caller logs SUPPRESSED_WHEEL on each True return.
+    """
+
+    REV_MAX_NOTCH = 1     # ±1 on REL_WHEEL = single notch (Type A signature)
+    REV_MAX_HI_RES = 120  # ±120 on REL_WHEEL_HI_RES = single notch
+    AXIS_TIE_MS = 8       # USB poll interval — keeps notch+hi-res paired
+
+    def __init__(self, name, *, enabled=True,
+                 cooldown_ms=1200, rev_window_ms=280,
+                 cooldown_ratio=0.5, min_primary=360,
+                 bounce_max_total=300, quiet_ms=200,
+                 type_b_enabled=False, max_cascade_depth=0):
+        self.name = name
+        self.enabled = enabled
+        self.cooldown_s = cooldown_ms / 1000.0
+        self.rev_window_s = rev_window_ms / 1000.0
+        self.cooldown_ratio = cooldown_ratio
+        self.min_primary = min_primary
+        self.bounce_max_total = bounce_max_total
+        self.quiet_s = quiet_ms / 1000.0
+        # Cap on cascade-extensions per anchor. 0 disables cascade-extend
+        # entirely — first small same-direction close clears the anchor.
+        # Higher values catch multi-stage decay cascades but lengthen the
+        # max suppression-lockout window. Default 0 errs toward
+        # responsiveness.
+        self.max_cascade_depth = max_cascade_depth
+        # Type B (same-direction re-burst) suppression is opt-in. The first
+        # event of a legitimate continuation scroll is indistinguishable
+        # from a Type B bounce on its first event, so the rule trades
+        # responsiveness for catch-rate. Default off; `--wheel-type-b` to
+        # opt in. When on, cooldown_consumed counts BOTH the Type B and
+        # axis-tie suppressions' full event magnitudes.
+        self.type_b_enabled = type_b_enabled
+        # State
+        self.last_closed = None           # _ClosedBurst | None
+        self.cooldown_consumed = 0        # same-dir mag suppressed in CURRENT burst
+        self.cascade_depth = 0            # number of cascade-extends since this anchor
+        self.last_forwarded_mono = None   # for mid-gesture detection
+        self.last_suppress_mono = None    # for axis-tie pairing
+        self.last_suppress_sign = 0
+        # Counters
+        self.suppressed_total = 0
+        self.suppressed_type_a = 0
+        self.suppressed_type_b = 0
+        self.suppressed_axis_tie = 0
+
+    def set_enabled(self, b):
+        """Toggle suppression at runtime (called from SIGUSR2 handler)."""
+        self.enabled = bool(b)
+
+    def note_burst_closed(self, dir_, abs_sum, end_mono):
+        """Called by WheelDiagnostics on every burst close (idle or reversal)."""
+        was_sig = abs_sum >= self.min_primary
+
+        if self.last_closed is None or not self.last_closed.was_significant:
+            self.last_closed = _ClosedBurst(dir_, abs_sum, end_mono, was_sig)
+            self.cooldown_consumed = 0
+            self.cascade_depth = 0
+            return
+
+        age_s = end_mono - self.last_closed.end_mono
+
+        if was_sig or age_s > self.cooldown_s:
+            # New primary (or cooldown expired) — replace anchor cleanly
+            self.last_closed = _ClosedBurst(dir_, abs_sum, end_mono, was_sig)
+            self.cooldown_consumed = 0
+            self.cascade_depth = 0
+            return
+
+        # Small burst (< min_primary) within an active cooldown.
+        if dir_ == self.last_closed.dir:
+            # Same-direction cascade continuation. Each bounce in a decay
+            # chain (605→242→121→…) gets a FRESH suppression budget — we
+            # reset cooldown_consumed so every cascade stage is fully
+            # caught. Cap chain depth so an indefinite stream of small
+            # same-direction bursts (a user genuinely scrolling slowly)
+            # doesn't lock the anchor forever.
+            self.cascade_depth += 1
+            if self.cascade_depth > self.max_cascade_depth:
+                self.last_closed = None
+                self.cooldown_consumed = 0
+                self.cascade_depth = 0
+                return
+            self.last_closed.end_mono = end_mono
+            self.cooldown_consumed = 0
+        else:
+            # Cross-direction small burst — user reversed direction
+            # legitimately, OR a Type A bounce already idled out. Either way,
+            # the original primary's bounce envelope no longer protects.
+            self.last_closed = None
+            self.cooldown_consumed = 0
+            self.cascade_depth = 0
+
+    def should_suppress(self, event, now_mono):
+        """Returns (suppress: bool, reason: str | None).
+
+        Hot path. Caller must filter to wheel events (REL_WHEEL or
+        REL_WHEEL_HI_RES) before invoking.
+        """
+        if not self.enabled:
+            self._mark_forwarded(now_mono)
+            return False, None
+
+        value = event.value
+        if value == 0:
+            return False, None
+
+        sign = 1 if value > 0 else -1
+        mag = abs(value)
+
+        # Axis-tie: REL_WHEEL and REL_WHEEL_HI_RES arrive paired within one
+        # USB poll. If we just suppressed an event with this sign within
+        # AXIS_TIE_MS, suppress the partner too — otherwise the consumer sees
+        # a half-pair and renders a partial scroll. CRITICAL: do NOT update
+        # last_suppress_mono here. Otherwise a stream of paired events 5ms
+        # apart keeps re-anchoring the 8ms window and never expires —
+        # producing the "scroll forever suppressed" bug observed in the
+        # 2026-05-10 production failure.
+        if (self.last_suppress_mono is not None and
+                (now_mono - self.last_suppress_mono) * 1000 <= self.AXIS_TIE_MS and
+                sign == self.last_suppress_sign):
+            self.suppressed_total += 1
+            self.suppressed_axis_tie += 1
+            # When Type B is opt-in active, count axis-tie magnitude toward
+            # the cooldown budget — otherwise hi-res events (always paired
+            # via axis-tie) bypass the budget and Type B never exhausts.
+            if self.type_b_enabled and self.last_closed is not None:
+                self.cooldown_consumed += mag
+            return True, "axis_tie"
+
+        lc = self.last_closed
+        if lc is None or not lc.was_significant:
+            self._mark_forwarded(now_mono)
+            return False, None
+
+        age_s = now_mono - lc.end_mono
+
+        # Type A: single-step opposite-direction event within REV_WINDOW.
+        # Fires AT MOST ONCE per anchor — a real reverse scroll arrives as
+        # many single-step events; suppressing all of them blocks legitimate
+        # use. The hardware bounce is a single transient pulse; if more
+        # opposite events follow, it's user intent.
+        if (sign == -lc.dir and age_s <= self.rev_window_s
+                and not lc.type_a_consumed):
+            rev_max = (self.REV_MAX_HI_RES
+                       if event.code == ecodes.REL_WHEEL_HI_RES
+                       else self.REV_MAX_NOTCH)
+            if mag <= rev_max:
+                lc.type_a_consumed = True
+                self.last_suppress_mono = now_mono
+                self.last_suppress_sign = sign
+                self.suppressed_total += 1
+                self.suppressed_type_a += 1
+                return True, "type_a_reversal"
+
+        # Type B: same-direction re-burst within COOLDOWN, magnitude-bounded.
+        # OPT-IN ONLY. The first event of a same-direction continuation
+        # after a normal pause is indistinguishable from a Type B bounce —
+        # erring toward "drop nothing" preserves wheel responsiveness, the
+        # user's load-bearing requirement.
+        if self.type_b_enabled and sign == lc.dir and age_s <= self.cooldown_s:
+            # Mid-gesture guard: rapid same-dir flow → user is scrolling, not
+            # bouncing. Skip on first event (no last_forwarded yet).
+            if (self.last_forwarded_mono is not None and
+                    (now_mono - self.last_forwarded_mono) <= self.quiet_s):
+                self._mark_forwarded(now_mono)
+                return False, None
+
+            budget = min(lc.abs_sum * self.cooldown_ratio, self.bounce_max_total)
+            if (self.cooldown_consumed + mag) <= budget:
+                self.cooldown_consumed += mag
+                self.last_suppress_mono = now_mono
+                self.last_suppress_sign = sign
+                self.suppressed_total += 1
+                self.suppressed_type_b += 1
+                return True, "type_b_cooldown"
+            # Past budget — let through. Anchor stays for cascade-catch on
+            # the next bounce burst.
+
+        self._mark_forwarded(now_mono)
+        return False, None
+
+    def _mark_forwarded(self, now_mono):
+        self.last_forwarded_mono = now_mono
 
 
 class DebouncedMouse:
@@ -624,7 +867,12 @@ class DelayedDebouncedMouse:
     def __init__(self, device, threshold_ms, warn_threshold_ms=None,
                  hold_threshold_ms=None, quiet=False, lag_threshold_ms=10,
                  button_remap=None, diagnose_move=False, diagnose_clicks=False,
-                 debounce_enabled=False, diagnose_wheel=False):
+                 debounce_enabled=False, diagnose_wheel=False,
+                 wheel_suppress=False, wheel_cooldown_ms=1200,
+                 wheel_rev_window_ms=280, wheel_cooldown_ratio=0.5,
+                 wheel_min_primary=360, wheel_bounce_max_total=300,
+                 wheel_quiet_ms=200, wheel_type_b=False,
+                 wheel_max_cascade_depth=0, wheel_multiplier=1):
         self.device = device
         self.threshold_s = threshold_ms / 1000.0
         self.button_remap = button_remap or {}  # {src_code: dst_code}
@@ -648,6 +896,7 @@ class DelayedDebouncedMouse:
         self.last_press_forwarded = {}  # btn -> monotonic_time (for pp_gap tracking)
         self.suppressed = 0
         self.total_clicks = 0
+        self.wheel_suppressed = 0
         # Latency tracking
         self.total_events = 0
         self.lag_spikes = 0
@@ -656,11 +905,44 @@ class DelayedDebouncedMouse:
         # Per-interval stats tracking (for --quiet: only log when notable)
         self._last_stats_suppressed = 0
         self._last_stats_lag_spikes = 0
+        self._last_stats_wheel_suppressed = 0
+        # Wheel-event value multiplier. Compensates for the loss of
+        # smooth-scroll velocity when running with Solaar's hi-res mode
+        # turned off (effective hardware-level bounce suppression). At >1,
+        # each forwarded REL_WHEEL / REL_WHEEL_HI_RES event has its value
+        # scaled. Suppression decisions still operate on the original.
+        self.wheel_multiplier = max(1, int(wheel_multiplier))
 
         # Movement diagnostics (only when --diagnose-move is active)
         self._move_diag = MoveDiagnostics(lag_threshold_ms=lag_threshold_ms) if diagnose_move else None
-        # Wheel diagnostics (only when --diagnose-wheel is active)
-        self._wheel_diag = WheelDiagnostics(name=device.name) if diagnose_wheel else None
+        # Wheel suppression — needs WheelDiagnostics to drive its anchor.
+        # When --diagnose-wheel is also on, diag emits log lines too;
+        # otherwise diag runs silently as a state engine.
+        self._wheel_suppressor = None
+        if wheel_suppress:
+            self._wheel_suppressor = WheelSuppressor(
+                name=device.name,
+                enabled=True,
+                cooldown_ms=wheel_cooldown_ms,
+                rev_window_ms=wheel_rev_window_ms,
+                cooldown_ratio=wheel_cooldown_ratio,
+                min_primary=wheel_min_primary,
+                bounce_max_total=wheel_bounce_max_total,
+                quiet_ms=wheel_quiet_ms,
+                type_b_enabled=wheel_type_b,
+                max_cascade_depth=wheel_max_cascade_depth,
+            )
+        # WheelDiagnostics: instantiate when --diagnose-wheel is on, OR when
+        # --wheel-suppress is on (suppressor needs the burst-close callback).
+        if diagnose_wheel or wheel_suppress:
+            cb = self._wheel_suppressor.note_burst_closed if self._wheel_suppressor else None
+            self._wheel_diag = WheelDiagnostics(
+                name=device.name,
+                on_burst_closed=cb,
+                emit_logs=diagnose_wheel,
+            )
+        else:
+            self._wheel_diag = None
 
         # Build uinput device. If we have remaps, add target key codes to
         # the capabilities — the physical mouse doesn't advertise KEY_VOLUMEUP etc,
@@ -719,10 +1001,42 @@ class DelayedDebouncedMouse:
         if self._move_diag and is_movement:
             self._move_diag.record_input(lag_ms)
 
-        # Record wheel events in diagnostics (read-only — never mutates stream)
-        if (self._wheel_diag and event.type == ecodes.EV_REL
-                and event.code in WheelDiagnostics.WHEEL_CODES):
+        # Record wheel events in diagnostics (state machine drives the
+        # suppressor's anchor via on_burst_closed callback).
+        is_wheel = (event.type == ecodes.EV_REL
+                    and event.code in WheelDiagnostics.WHEEL_CODES)
+        if self._wheel_diag and is_wheel:
             self._wheel_diag.observe(event, now)
+
+        # Wheel-bounce suppression. Decision is O(1); fires after observe so
+        # the anchor reflects any burst that just closed on this event.
+        if self._wheel_suppressor and is_wheel:
+            suppress, reason = self._wheel_suppressor.should_suppress(event, now)
+            if suppress:
+                self.wheel_suppressed += 1
+                lc = self._wheel_suppressor.last_closed
+                age_ms = 0
+                primary_sum = 0
+                if lc is not None:
+                    age_ms = int(round((now - lc.end_mono) * 1000))
+                    primary_sum = lc.abs_sum
+                axis = ("HI_RES" if event.code == ecodes.REL_WHEEL_HI_RES
+                        else "WHEEL")
+                sign_char = '+' if event.value > 0 else '-'
+                log(f"SUPPRESSED_WHEEL on {self.name}: reason={reason} "
+                    f"axis={axis} sign={sign_char} mag={abs(event.value)} "
+                    f"age_ms={age_ms} primary_sum={primary_sum} "
+                    f"(suppressed_total={self._wheel_suppressor.suppressed_total})",
+                    also_print=False)
+                return False
+
+        # Wheel multiplier: scale forwarded value when the user has reduced
+        # hardware-level scroll resolution (via Solaar) and wants the per-
+        # click scroll distance compensated back up.
+        if is_wheel and self.wheel_multiplier > 1:
+            event = evdev.InputEvent(event.sec, event.usec, event.type,
+                                     event.code,
+                                     event.value * self.wheel_multiplier)
 
         # Button remapping: transform code and forward immediately (no debounce)
         if event.type == ecodes.EV_KEY and event.code in self.button_remap:
@@ -873,12 +1187,57 @@ class DelayedDebouncedMouse:
     def has_notable_events(self):
         """True if suppressions or lag spikes occurred since last stats."""
         return (self.suppressed > self._last_stats_suppressed or
-                self.lag_spikes > self._last_stats_lag_spikes)
+                self.lag_spikes > self._last_stats_lag_spikes or
+                self.wheel_suppressed > self._last_stats_wheel_suppressed)
 
     def record_stats(self):
         """Snapshot current counts for next interval comparison."""
         self._last_stats_suppressed = self.suppressed
         self._last_stats_lag_spikes = self.lag_spikes
+        self._last_stats_wheel_suppressed = self.wheel_suppressed
+
+    def set_wheel_suppress(self, enabled):
+        """Toggle wheel-bounce suppression at runtime (driven by SIGUSR2).
+
+        No-op when --wheel-suppress was not passed at startup (no suppressor
+        instance exists). In that case, runtime enable is intentionally not
+        supported — bounce-state would be uninitialized.
+        """
+        if self._wheel_suppressor is not None:
+            self._wheel_suppressor.set_enabled(enabled)
+
+
+def make_wheel_suppress_toggle(mouse_registry):
+    """Build a SIGUSR2 handler that toggles wheel suppression on every mouse.
+
+    The signal handler reads the *current* state from the first available
+    suppressor and flips it (so on→off and off→on). All mice flip together;
+    a `WHEEL_SUPPRESS_TOGGLE: on|off` log line records the new state.
+
+    The mouse_registry is the live list of DelayedDebouncedMouse instances —
+    passed by reference so hotplug additions automatically inherit the
+    current toggle state on the next signal. (Newly added mice still come up
+    in their startup state, but the next SIGUSR2 will flip them along with
+    everyone else.)
+    """
+    def handler(sig, frame):
+        # Determine the new state by inverting the first suppressor's current
+        # state. If no mice have a suppressor (--wheel-suppress not set at
+        # startup), fall through to logging the no-op.
+        new_state = None
+        for m in mouse_registry:
+            sup = getattr(m, '_wheel_suppressor', None)
+            if sup is not None:
+                new_state = not sup.enabled
+                break
+        if new_state is None:
+            log("WHEEL_SUPPRESS_TOGGLE: ignored (no suppressors active — "
+                "start mouse-filter with --wheel-suppress to enable)")
+            return
+        for m in mouse_registry:
+            m.set_wheel_suppress(new_state)
+        log(f"WHEEL_SUPPRESS_TOGGLE: {'on' if new_state else 'off'}")
+    return handler
 
 
 def main():
@@ -927,6 +1286,52 @@ def main():
                              "directional bursts and logs WHEEL_REV on sign flips and "
                              "WHEEL_BURST_END on idle close-out. Read-only — never "
                              "mutates the forwarded event stream.")
+    parser.add_argument("--wheel-suppress", action="store_true",
+                        help="Drop hardware-rebound wheel events on smooth-scroll "
+                             "wheels (e.g. Logitech MX 2). Two rules: Type A "
+                             "(single-step opposite-direction reversal within window) "
+                             "and Type B (same-direction re-burst, magnitude-bounded). "
+                             "Toggle at runtime by sending SIGUSR2 to the daemon.")
+    parser.add_argument("--wheel-cooldown-ms", type=int, default=1200,
+                        help="Type B same-direction cooldown window in ms after a "
+                             "significant primary burst ends (default: 1200).")
+    parser.add_argument("--wheel-rev-window-ms", type=int, default=280,
+                        help="Type A reversal-veto window in ms after a primary "
+                             "ends (default: 280).")
+    parser.add_argument("--wheel-cooldown-ratio", type=float, default=0.5,
+                        help="Suppress same-direction bounces only up to "
+                             "primary_sum * ratio (default: 0.5).")
+    parser.add_argument("--wheel-min-primary", type=int, default=360,
+                        help="Minimum primary burst magnitude (hi-res units) to "
+                             "arm the cooldown (default: 360, ≈ 3 notches).")
+    parser.add_argument("--wheel-bounce-max-total", type=int, default=300,
+                        help="Hard cap on cumulative magnitude suppressed per "
+                             "cooldown — prevents runaway false positives on tail "
+                             "bounces (default: 300).")
+    parser.add_argument("--wheel-quiet-ms", type=int, default=200,
+                        help="Mid-gesture guard: if events stream within this gap "
+                             "after a forwarded event, never suppress — user is "
+                             "scrolling, not bouncing (default: 200).")
+    parser.add_argument("--wheel-type-b", action="store_true",
+                        help="Opt in to Type B (same-direction re-burst) "
+                             "suppression. OFF by default because the first "
+                             "event of a continuation scroll is "
+                             "indistinguishable from a Type B bounce, so the "
+                             "rule trades responsiveness for catch-rate. "
+                             "Type A (cross-direction reversal) is unaffected.")
+    parser.add_argument("--wheel-max-cascade-depth", type=int, default=0,
+                        help="Number of cascade-extensions allowed per anchor "
+                             "(default: 0 — disables cascade-extend; one "
+                             "anchor catches one bounce stage, then clears). "
+                             "Higher values catch multi-stage decay cascades "
+                             "but lengthen the max lockout window.")
+    parser.add_argument("--wheel-multiplier", type=int, default=1,
+                        help="Scale forwarded REL_WHEEL / REL_WHEEL_HI_RES "
+                             "event values by N (default: 1, no change). Use "
+                             "with Solaar's high-res scroll mode turned OFF: "
+                             "low-res mode ignores sub-detent bounces but "
+                             "feels slow; this puts the perceived speed back. "
+                             "Try 2 or 3.")
     args = parser.parse_args()
 
     # Parse button remaps
@@ -970,6 +1375,18 @@ def main():
         sys.exit(1)
 
     mice = []
+    wheel_suppress_kwargs = dict(
+        wheel_suppress=args.wheel_suppress,
+        wheel_cooldown_ms=args.wheel_cooldown_ms,
+        wheel_rev_window_ms=args.wheel_rev_window_ms,
+        wheel_cooldown_ratio=args.wheel_cooldown_ratio,
+        wheel_min_primary=args.wheel_min_primary,
+        wheel_bounce_max_total=args.wheel_bounce_max_total,
+        wheel_quiet_ms=args.wheel_quiet_ms,
+        wheel_type_b=args.wheel_type_b,
+        wheel_max_cascade_depth=args.wheel_max_cascade_depth,
+        wheel_multiplier=args.wheel_multiplier,
+    )
     for dev in devices:
         try:
             dm = DelayedDebouncedMouse(dev, args.threshold,
@@ -981,7 +1398,8 @@ def main():
                                        diagnose_move=args.diagnose_move,
                                        diagnose_clicks=args.diagnose_clicks,
                                        debounce_enabled=args.debounce,
-                                       diagnose_wheel=args.diagnose_wheel)
+                                       diagnose_wheel=args.diagnose_wheel,
+                                       **wheel_suppress_kwargs)
             mice.append(dm)
             log(f"Filtering: {dev.name} ({dev.path}) -> {dm.uinput.name}")
         except Exception as e:
@@ -1041,6 +1459,29 @@ def main():
         log(f"  Click diagnostics: ENABLED (logging to {LOG_FILE})")
     if args.diagnose_wheel:
         log(f"  Wheel diagnostics: ENABLED (logging to {LOG_FILE})")
+    log(f"  Wheel multiplier:  {args.wheel_multiplier}x  "
+        f"(forwarded wheel event values scaled)",
+        also_print=not q)
+    log(f"  Wheel suppress:    {'ON' if args.wheel_suppress else 'OFF'}  "
+        f"(toggle: systemctl kill -s SIGUSR2 mouse-filter.service)",
+        also_print=not q)
+    if args.wheel_suppress:
+        log(f"    Type A (reversal):       ON (single-step opposite, "
+            f"fires once per anchor)",
+            also_print=not q)
+        log(f"    Type B (same-direction): "
+            f"{'ON (--wheel-type-b)' if args.wheel_type_b else 'off'}",
+            also_print=not q)
+        log(f"    cooldown_ms={args.wheel_cooldown_ms}  "
+            f"rev_window_ms={args.wheel_rev_window_ms}  "
+            f"cooldown_ratio={args.wheel_cooldown_ratio}",
+            also_print=not q)
+        log(f"    min_primary={args.wheel_min_primary}  "
+            f"bounce_max_total={args.wheel_bounce_max_total}  "
+            f"quiet_ms={args.wheel_quiet_ms}",
+            also_print=not q)
+    # Always log the initial toggle state — mouse-suppress status reads this.
+    log(f"WHEEL_SUPPRESS_TOGGLE: {'on' if args.wheel_suppress else 'off'}")
 
     running = True
 
@@ -1055,6 +1496,12 @@ def main():
         log_user_tag()
 
     signal.signal(signal.SIGUSR1, handle_user_tag)
+
+    # SIGUSR2: toggle wheel-bounce suppression at runtime. The mice list is
+    # passed by reference so hotplug additions are picked up on the next
+    # signal. The polkit rule installed by install.sh permits the invoking
+    # user to send signals to this service without auth.
+    signal.signal(signal.SIGUSR2, make_wheel_suppress_toggle(mice))
 
     # Build fd -> mouse mapping for select()
     fd_map = {m.device.fd: m for m in mice}
@@ -1144,7 +1591,8 @@ def main():
                         diagnose_move=args.diagnose_move,
                         diagnose_clicks=args.diagnose_clicks,
                         debounce_enabled=args.debounce,
-                        diagnose_wheel=args.diagnose_wheel)
+                        diagnose_wheel=args.diagnose_wheel,
+                        **wheel_suppress_kwargs)
                     mice.append(dm)
                     fd_map[dm.device.fd] = dm
                     active_paths.add(dev.path)

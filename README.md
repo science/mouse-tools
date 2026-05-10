@@ -6,6 +6,7 @@ Mouse management utilities for Linux, built on evdev. A single `mouse-filter` da
 
 - **Button remapping** — Remaps mouse buttons to keyboard keys (e.g., forward/back to volume up/down). A lightweight replacement for input-remapper when all you need is simple button remaps.
 - **Button debounce (opt-in)** — Suppresses phantom button releases on worn Logitech (and other) mice with bouncing micro-switches. Off by default; enable with `--debounce` if your hardware needs it.
+- **Wheel-bounce suppression (opt-in)** — Drops hardware-rebound wheel events on smooth-scroll wheels (e.g., Logitech MX 2 with detents disabled). Catches both cross-direction (sign-flip) and same-direction (re-burst) rebounds. Off by default; enable with `--wheel-suppress`. Toggle live with `mouse-suppress on|off|toggle`.
 
 ## The Bounce Problem (when --debounce is needed)
 
@@ -38,10 +39,27 @@ Remap mouse buttons to keyboard keys using `--remap`. Remapped buttons bypass de
 
 The remap target keycodes are injected into the virtual uinput device's capability list, since the physical mouse doesn't advertise keyboard keys like `KEY_VOLUMEUP`.
 
+### Wheel-Bounce Suppression (opt-in via `--wheel-suppress`)
+
+Smooth-scroll wheels (Logitech MX 2 with detents disabled) exhibit hardware-level rebound after a scroll burst:
+
+- **Type A** — single-step opposite-direction pulse arriving 67–240ms after a primary burst (kinetic backswing).
+- **Type B** — same-direction re-burst arriving 250ms–4s later, typically ≤ ½ the primary's magnitude (residual momentum). Cascade chains observed: 605 → 242 → 121.
+
+The suppressor arms a per-mouse cooldown anchor on every burst close (driven by `WheelDiagnostics`'s state machine) and applies two rules:
+
+- **Type A veto** — drop a single-step (`±1` notch / `±120` hi-res) opposite-direction event arriving within `--wheel-rev-window-ms` of a significant primary's end.
+- **Type B cooldown** — drop same-direction events within `--wheel-cooldown-ms` of a primary's end, capped at `min(primary*ratio, max_total)`. Once the cap is hit, the rest of the burst flows through normally.
+
+A mid-gesture guard prevents false-positives during continuous scrolling, and an axis-tie keeps `REL_WHEEL` and `REL_WHEEL_HI_RES` paired across decisions. The decision is O(1) on the hot path; no buffering or added latency.
+
+**Runtime toggle**: `mouse-suppress on|off|toggle|status`. Sends SIGUSR2 to the daemon (auth-free via the polkit rule install.sh deploys); the daemon flips state and writes a `WHEEL_SUPPRESS_TOGGLE` line to the log. Pair with `--diagnose-wheel` for the first week so you can audit `SUPPRESSED_WHEEL` lines against perceived behavior.
+
 ### Event Pipeline
 
 ```
 Physical mouse → /dev/input/eventN → mouse-filter (grabs device)
+    → wheel-burst classification → wheel-suppress decision (drop or pass)
     → remap buttons (if configured) → debounce filter → uinput virtual device → X11/Wayland
 ```
 
@@ -108,6 +126,20 @@ Options:
                         reversals to the log file. Use to characterize
                         wheel-rebound behavior on smooth-scroll wheels
                         before deciding on a suppression policy.
+  --wheel-suppress      Enable wheel-bounce suppression (Type A + Type B).
+                        Off by default. Toggle live: mouse-suppress on|off.
+  --wheel-cooldown-ms N Type B same-direction window in ms (default: 1200).
+  --wheel-rev-window-ms N
+                        Type A reversal-veto window in ms (default: 280).
+  --wheel-cooldown-ratio R
+                        Suppress same-dir bounces up to primary*R (default: 0.5).
+  --wheel-min-primary N Min burst magnitude (hi-res units) to arm the
+                        cooldown (default: 360).
+  --wheel-bounce-max-total N
+                        Hard cap on cumulative magnitude suppressed per
+                        cooldown (default: 300).
+  --wheel-quiet-ms N    Mid-gesture guard window — never suppress within
+                        this gap of a forwarded event (default: 200).
 ```
 
 ## Logging
@@ -122,11 +154,18 @@ Events are logged to `~/.local/share/mouse-filter/debounce.log` (uses `$SUDO_USE
 | `MOVE_DIAG` | Movement pipeline breakdown with per-stage latency (only with `--diagnose-move`). |
 | `WHEEL_REV` | Wheel scroll direction reversal — candidate rebound. Logs prev burst sum/count and reversal value/gap (only with `--diagnose-wheel`, file-only). |
 | `WHEEL_BURST_END` | A wheel scroll burst closed out after an idle gap. Summarizes total / count / duration (only with `--diagnose-wheel`, file-only). |
+| `SUPPRESSED_WHEEL` | A wheel event was dropped by the suppression filter. Includes `reason=` (type_a_reversal / type_b_cooldown / axis_tie), magnitude, age from primary end, primary sum. Always logged when `--wheel-suppress` is on; file-only. |
+| `WHEEL_SUPPRESS_TOGGLE` | Suppression state change (on|off). Emitted at startup and on each SIGUSR2. Used by `mouse-suppress status` to read current state. |
 | `USER_TAG` | User-pressed marker (SIGUSR1). Use to bookmark moments when a UX glitch was perceived, so the surrounding log lines can be inspected. Send via `systemctl kill -s SIGUSR1 mouse-filter.service` or the `mouse-tag` panel launcher. |
 
-### Auth-free tagging (polkit rule)
+### Auth-free signaling (polkit rule)
 
-`install.sh` writes a narrow polkit rule at `/etc/polkit-1/rules.d/50-mouse-filter-tag.rules` that allows the invoking user (`$SUDO_USER`) to send signals to `mouse-filter.service` without an auth prompt — but only when in an active console session, only on this one service, only for the `kill` verb. This makes the panel-launcher tagging click frictionless without expanding any group memberships. Removed by `install.sh --uninstall`.
+`install.sh` writes a narrow polkit rule at `/etc/polkit-1/rules.d/50-mouse-filter-tag.rules` that allows the invoking user (`$SUDO_USER`) to send signals to `mouse-filter.service` without an auth prompt — but only when in an active console session, only on this one service, only for the `kill` verb. The rule is signal-agnostic and covers both:
+
+- `mouse-tag` → SIGUSR1 → `USER_TAG: marker` log line
+- `mouse-suppress on|off|toggle` → SIGUSR2 → flips wheel suppression + `WHEEL_SUPPRESS_TOGGLE` log line
+
+No fingerprint prompt, no group membership expansion. Removed by `install.sh --uninstall`.
 
 Fast double-clicks (short hold < 150ms followed by fast re-press) are silently allowed through without logging — they're normal user behavior, not bounces.
 

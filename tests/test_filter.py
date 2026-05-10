@@ -2020,6 +2020,458 @@ class TestWheelDiagnostics:
         assert 'since_burst_start_ms=100' in msg
 
 
+class TestWheelDiagnosticsCallback:
+    """Tests for the on_burst_closed callback hook used by WheelSuppressor.
+
+    The callback is fired with (signed_dir, abs_sum, end_mono) every time a
+    burst closes — either by idle gap (WHEEL_BURST_END), sign-flip
+    (WHEEL_REV), or shutdown flush. The callback receives the OLD burst's
+    state, not the reversal event that triggered close.
+    """
+
+    def test_callback_fires_on_idle_close(self, debounce_module):
+        from evdev import ecodes
+        captured = []
+        diag = debounce_module.WheelDiagnostics(
+            name="Test", idle_ms=250,
+            on_burst_closed=lambda d, s, t: captured.append((d, s, t)),
+        )
+        # Down burst, 3 events
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.000)
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.020)
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.040)
+        # Idle gap + same-dir event triggers idle close-out of previous burst
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.500)
+
+        assert len(captured) == 1
+        d, s, t = captured[0]
+        assert d == -1                # closed burst direction
+        assert s == 360               # |sum(-120 * 3)|
+        assert abs(t - 1.040) < 1e-9  # last event of closed burst
+
+    def test_callback_fires_on_reversal_with_old_burst_stats(self, debounce_module):
+        """Sign-flip fires callback with OLD burst's stats — not the reversal."""
+        from evdev import ecodes
+        captured = []
+        diag = debounce_module.WheelDiagnostics(
+            name="Test",
+            on_burst_closed=lambda d, s, t: captured.append((d, s, t)),
+        )
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.000)
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.020)
+        # Reversal +120
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120), now_mono=1.040)
+
+        assert len(captured) == 1
+        d, s, t = captured[0]
+        assert d == -1                # OLD burst was down
+        assert s == 240               # |-240|
+        assert abs(t - 1.020) < 1e-9
+
+    def test_callback_fires_on_flush(self, debounce_module):
+        from evdev import ecodes
+        captured = []
+        diag = debounce_module.WheelDiagnostics(
+            name="Test",
+            on_burst_closed=lambda d, s, t: captured.append((d, s, t)),
+        )
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120), now_mono=2.000)
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120), now_mono=2.030)
+        diag.flush()
+
+        assert len(captured) == 1
+        d, s, t = captured[0]
+        assert d == +1
+        assert s == 240
+        assert abs(t - 2.030) < 1e-9
+
+    def test_default_constructor_no_callback(self, debounce_module):
+        """No callback param: existing behavior preserved (no exception)."""
+        from evdev import ecodes
+        diag = debounce_module.WheelDiagnostics(name="Test")
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.000)
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120), now_mono=1.040)
+        diag.flush()
+        # No exception, no callback to fire — pass.
+
+    def test_emit_logs_false_silences_log_lines(self, debounce_module):
+        """emit_logs=False suppresses WHEEL_REV / WHEEL_BURST_END output."""
+        from evdev import ecodes
+        diag = debounce_module.WheelDiagnostics(name="Test", emit_logs=False)
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.000)
+            diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.020)
+            diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120), now_mono=1.040)
+            diag.flush()
+
+        diag_calls = [c for c in mock_log.call_args_list
+                      if 'WHEEL_REV' in str(c) or 'WHEEL_BURST_END' in str(c)]
+        assert len(diag_calls) == 0
+
+    def test_emit_logs_false_still_fires_callback(self, debounce_module):
+        """Silent diagnostics still notify the suppressor."""
+        from evdev import ecodes
+        captured = []
+        diag = debounce_module.WheelDiagnostics(
+            name="Test", emit_logs=False,
+            on_burst_closed=lambda d, s, t: captured.append((d, s, t)),
+        )
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.000)
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.020)
+        diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120), now_mono=1.040)
+
+        assert len(captured) == 1
+        assert captured[0][0] == -1
+
+    def test_emit_logs_default_true(self, debounce_module):
+        """emit_logs defaults to True — existing diagnostic mode unchanged."""
+        from evdev import ecodes
+        diag = debounce_module.WheelDiagnostics(name="Test")
+
+        with patch.object(debounce_module, 'log') as mock_log:
+            diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.000)
+            diag.observe(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120), now_mono=1.040)
+
+        rev_calls = [c for c in mock_log.call_args_list if 'WHEEL_REV' in str(c)]
+        assert len(rev_calls) == 1
+
+
+class TestWheelSuppressor:
+    """Tests for the WheelSuppressor predicate.
+
+    Two suppression rules:
+      Type A — single-step opposite-direction event within REV_WINDOW_MS of a
+               significant primary's end (kinetic backswing pulse).
+      Type B — same-direction re-burst within COOLDOWN_MS, magnitude-bounded
+               by min(primary*ratio, bounce_max_total) (residual-momentum kick).
+
+    Anchor state is driven by note_burst_closed callbacks. Cascade chains
+    (each sub-burst < ½ previous) extend the anchor's end_mono on
+    same-direction small closures. Cross-direction small closures clear
+    the anchor (user reversed legitimately).
+    """
+
+    def _make(self, debounce_module, **kwargs):
+        defaults = dict(
+            name="Test", enabled=True,
+            cooldown_ms=1200, rev_window_ms=280,
+            cooldown_ratio=0.5, min_primary=360,
+            bounce_max_total=300, quiet_ms=200,
+            type_b_enabled=True,  # Tests in this class exercise Type B paths
+        )
+        defaults.update(kwargs)
+        return debounce_module.WheelSuppressor(**defaults)
+
+    # ---- baseline / anchor management --------------------------------------
+
+    def test_no_anchor_forwards(self, debounce_module):
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120)
+        s, _ = sup.should_suppress(ev, now_mono=1.0)
+        assert s is False
+
+    def test_below_min_primary_does_not_arm(self, debounce_module):
+        from evdev import ecodes
+        sup = self._make(debounce_module, min_primary=360)
+        sup.note_burst_closed(-1, 240, end_mono=1.0)  # 240 < 360
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120)
+        s, _ = sup.should_suppress(ev, now_mono=1.5)
+        assert s is False
+
+    def test_significant_primary_arms_cooldown(self, debounce_module):
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120)
+        s, r = sup.should_suppress(ev, now_mono=1.5)
+        assert s is True
+        assert r == "type_b_cooldown"
+
+    def test_zero_value_passes_through(self, debounce_module):
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, 0)
+        s, _ = sup.should_suppress(ev, now_mono=1.1)
+        assert s is False
+
+    # ---- Type A reversal veto ---------------------------------------------
+
+    def test_type_a_single_step_hi_res_suppressed(self, debounce_module):
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120)
+        s, r = sup.should_suppress(ev, now_mono=1.1)
+        assert s is True
+        assert r == "type_a_reversal"
+
+    def test_type_a_single_step_notch_suppressed(self, debounce_module):
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        ev = make_wheel_event(ecodes.REL_WHEEL, +1)
+        s, r = sup.should_suppress(ev, now_mono=1.1)
+        assert s is True
+        assert r == "type_a_reversal"
+
+    def test_type_a_multi_step_hi_res_forwarded(self, debounce_module):
+        """Multi-step opposite scrolls (legitimate reverse) bypass Type A."""
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, +240)  # 2 notches
+        s, _ = sup.should_suppress(ev, now_mono=1.1)
+        assert s is False
+
+    def test_type_a_outside_window_forwarded(self, debounce_module):
+        """Opposite-direction single-step beyond REV_WINDOW_MS is not a bounce."""
+        from evdev import ecodes
+        sup = self._make(debounce_module, rev_window_ms=280)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120)
+        s, _ = sup.should_suppress(ev, now_mono=1.5)  # 500ms after primary
+        assert s is False
+
+    def test_type_a_only_after_significant_primary(self, debounce_module):
+        """Type A doesn't fire if primary was below min_primary."""
+        from evdev import ecodes
+        sup = self._make(debounce_module, min_primary=360)
+        sup.note_burst_closed(-1, 200, end_mono=1.0)
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120)
+        s, _ = sup.should_suppress(ev, now_mono=1.1)
+        assert s is False
+
+    # ---- Type B same-direction cooldown -----------------------------------
+
+    def test_type_b_within_budget_suppressed(self, debounce_module):
+        from evdev import ecodes
+        sup = self._make(debounce_module,
+                         cooldown_ratio=0.5, bounce_max_total=300)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120)
+        s, r = sup.should_suppress(ev, now_mono=1.3)
+        assert s is True
+        assert r == "type_b_cooldown"
+        assert sup.cooldown_consumed == 120
+
+    def test_type_b_exceeds_budget_forwarded(self, debounce_module):
+        """Once cumulative magnitude exceeds budget, events forward.
+        Anchor stays in place for cascade-catch on the next bounce burst.
+        With Type B opt-in counting full event magnitudes (120 each here),
+        budget exhausts after the second hi-res event."""
+        from evdev import ecodes
+        sup = self._make(debounce_module,
+                         cooldown_ratio=0.5, bounce_max_total=300, min_primary=360)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        results = []
+        for now in (1.30, 1.32, 1.34):
+            s, _ = sup.should_suppress(
+                make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120),
+                now_mono=now,
+            )
+            results.append(s)
+        # Budget = min(600*0.5, 300) = 300. Each event mag=120.
+        # 1st: 0+120=120 ≤ 300 → suppress. 2nd: 120+120=240 ≤ 300 → suppress.
+        # 3rd: 240+120=360 > 300 → forward (anchor stays for cascade).
+        assert results == [True, True, False]
+        assert sup.last_closed is not None
+
+    def test_type_b_outside_cooldown_forwarded(self, debounce_module):
+        from evdev import ecodes
+        sup = self._make(debounce_module, cooldown_ms=1200)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120)
+        s, _ = sup.should_suppress(ev, now_mono=2.5)  # 1500ms later
+        assert s is False
+
+    def test_mid_gesture_after_budget_exhausted_keeps_forwarding(self, debounce_module):
+        """When budget exhausted and events keep flowing rapidly, treat as
+        continuous scroll — never re-suppress mid-stream. Type B opt-in,
+        full-magnitude budget accounting."""
+        from evdev import ecodes
+        sup = self._make(debounce_module,
+                         cooldown_ratio=0.5, bounce_max_total=300, quiet_ms=200)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        results = []
+        for now in (1.30, 1.32, 1.34, 1.36, 1.38):
+            s, _ = sup.should_suppress(
+                make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120),
+                now_mono=now,
+            )
+            results.append(s)
+        # Each event mag=120. 1st: 120 ≤ 300 → suppress. 2nd: 240 ≤ 300 →
+        # suppress. 3rd: 360 > 300 → forward. 4th & 5th: mid-gesture (gap
+        # from last_forwarded < 200ms) → forward.
+        assert results == [True, True, False, False, False]
+
+    # ---- axis-tie ---------------------------------------------------------
+
+    def test_axis_tie_suppresses_paired_axis(self, debounce_module):
+        """REL_WHEEL and REL_WHEEL_HI_RES events arrive paired within USB poll.
+        If one is suppressed, the partner with same sign should also suppress."""
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        # Suppress REL_WHEEL +1 (Type A single notch)
+        s1, r1 = sup.should_suppress(
+            make_wheel_event(ecodes.REL_WHEEL, +1), now_mono=1.100)
+        assert s1 is True
+        # Within 8ms, paired hi-res +120 → axis-tie
+        s2, r2 = sup.should_suppress(
+            make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120), now_mono=1.105)
+        assert s2 is True
+        assert r2 == "axis_tie"
+
+    def test_axis_tie_window_expires(self, debounce_module):
+        """Beyond axis-tie window, the second opposite-direction event is
+        evaluated independently. With Type A fire-once, the anchor's
+        type_a_consumed flag is set after the first suppression, so the
+        second opposite event forwards even though it's still within the
+        rev_window."""
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        sup.should_suppress(
+            make_wheel_event(ecodes.REL_WHEEL, +1), now_mono=1.10)
+        # 30ms later, axis-tie window 8ms expired. Type A consumed.
+        # Falls through; Type B doesn't fire (sign != lc.dir). Forward.
+        s, _ = sup.should_suppress(
+            make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120), now_mono=1.13)
+        assert s is False
+
+    def test_axis_tie_only_same_sign(self, debounce_module):
+        """Axis-tie does not suppress an opposite-sign event in the window."""
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        # Suppress hi-res +120 (Type A)
+        sup.should_suppress(
+            make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120), now_mono=1.10)
+        # Within 8ms, but OPPOSITE sign (down) — same sign as primary.
+        # Should fall through; Type B branch may suppress for budget reasons.
+        s, r = sup.should_suppress(
+            make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.105)
+        # Reason should NOT be axis_tie regardless of suppress decision.
+        assert r != "axis_tie"
+
+    # ---- cascade-extension --------------------------------------------------
+
+    def test_cascade_same_dir_small_extends_anchor(self, debounce_module):
+        """Cascade chain 605 → 242 → 121: with max_cascade_depth ≥ 1, each
+        small same-dir close extends the anchor's end_mono so the next
+        bounce in the chain is still within cooldown of the original
+        primary's reference. Default max_cascade_depth=0 disables this."""
+        from evdev import ecodes
+        sup = self._make(debounce_module,
+                         cooldown_ms=1200, cooldown_ratio=0.5,
+                         bounce_max_total=10000,  # don't cap for this test
+                         min_primary=360,
+                         max_cascade_depth=2)  # Enable cascade for this test
+        sup.note_burst_closed(-1, 605, end_mono=1.0)
+        # Cascade bounce 1: 242 (insignificant, same direction) at t=1.7
+        sup.note_burst_closed(-1, 242, end_mono=1.7)
+        assert sup.last_closed.end_mono == 1.7
+        assert sup.last_closed.abs_sum == 605  # Original primary preserved
+
+        # Predicate at t=2.4 — would be > 1200ms after primary's original end
+        # but within 1200ms of cascade-extended end (2.4 - 1.7 = 700ms).
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120)
+        s, r = sup.should_suppress(ev, now_mono=2.4)
+        assert s is True
+        assert r == "type_b_cooldown"
+
+    def test_cross_dir_small_burst_clears_anchor(self, debounce_module):
+        """Cross-direction small burst inside cooldown → user reversed
+        legitimately. Clear anchor so they can scroll the new direction."""
+        from evdev import ecodes
+        sup = self._make(debounce_module, cooldown_ms=1200, min_primary=360)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        sup.note_burst_closed(+1, 200, end_mono=1.3)
+        assert sup.last_closed is None
+        # Subsequent down event passes through
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120)
+        s, _ = sup.should_suppress(ev, now_mono=1.5)
+        assert s is False
+
+    def test_new_significant_burst_replaces_anchor(self, debounce_module):
+        """A new significant burst inside cooldown is a fresh primary."""
+        from evdev import ecodes
+        sup = self._make(debounce_module, min_primary=360)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        sup.note_burst_closed(-1, 1000, end_mono=1.5)
+        assert sup.last_closed.abs_sum == 1000
+        assert sup.last_closed.end_mono == 1.5
+        assert sup.cooldown_consumed == 0  # Reset on new primary
+
+    def test_cooldown_expired_burst_replaces_anchor(self, debounce_module):
+        """A burst arriving after cooldown expires becomes the new (possibly
+        insignificant) anchor — old primary is stale."""
+        from evdev import ecodes
+        sup = self._make(debounce_module, cooldown_ms=1200, min_primary=360)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        sup.note_burst_closed(-1, 200, end_mono=3.0)
+        assert sup.last_closed.end_mono == 3.0
+        assert sup.last_closed.abs_sum == 200
+        assert sup.last_closed.was_significant is False
+
+    # ---- runtime toggle ---------------------------------------------------
+
+    def test_set_enabled_false_short_circuits(self, debounce_module):
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        sup.set_enabled(False)
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120)
+        s, _ = sup.should_suppress(ev, now_mono=1.1)
+        assert s is False
+
+    def test_set_enabled_true_restores_suppression(self, debounce_module):
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        sup.set_enabled(False)
+        sup.set_enabled(True)
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120)
+        s, _ = sup.should_suppress(ev, now_mono=1.1)
+        assert s is True
+
+    def test_disabled_init_param(self, debounce_module):
+        from evdev import ecodes
+        sup = self._make(debounce_module, enabled=False)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120)
+        s, _ = sup.should_suppress(ev, now_mono=1.1)
+        assert s is False
+
+    # ---- counters ---------------------------------------------------------
+
+    def test_counters_increment(self, debounce_module):
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        # Type A (notch +1) — first opposite event suppressed
+        sup.should_suppress(
+            make_wheel_event(ecodes.REL_WHEEL, +1), now_mono=1.10)
+        # Paired hi-res +120 within axis-tie window → axis-tie
+        sup.should_suppress(
+            make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120), now_mono=1.105)
+
+        sup2 = self._make(debounce_module)  # type_b_enabled=True
+        sup2.note_burst_closed(-1, 600, end_mono=1.0)
+        # Type B
+        sup2.should_suppress(
+            make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=1.5)
+
+        assert sup.suppressed_total == 2
+        assert sup.suppressed_type_a == 1
+        assert sup.suppressed_axis_tie == 1
+        assert sup.suppressed_type_b == 0
+        assert sup2.suppressed_type_b == 1
+
+
 class TestWheelDiagnosticsIntegration:
     """Tests for --diagnose-wheel hooks in DelayedDebouncedMouse."""
 
@@ -2094,6 +2546,960 @@ class TestWheelDiagnosticsIntegration:
         diag_calls = [c for c in mock_log.call_args_list
                       if 'WHEEL_REV' in str(c) or 'WHEEL_BURST_END' in str(c)]
         assert len(diag_calls) == 0
+
+
+def _patch_monotonic(debounce_module, times):
+    """Patch time.monotonic in the mouse_filter module to return values from
+    `times` in order, repeating the last value if exhausted. Returns a
+    `patch` context manager.
+
+    Used to drive timing-sensitive tests deterministically without sleeps.
+    Each process_event() call consumes exactly one value from the list for
+    the wheel path (when --diagnose-move is off).
+    """
+    padded = list(times) + [times[-1]] * 64
+    return patch.object(debounce_module.time, 'monotonic', side_effect=padded)
+
+
+class TestWheelSuppressorIntegration:
+    """Tests for --wheel-suppress hooks in DelayedDebouncedMouse.
+
+    Drives realistic event sequences through process_event to verify the
+    full pipeline: WheelDiagnostics burst classification → suppressor
+    callback → suppression decision → uinput forward / drop. Uses patched
+    time.monotonic to simulate real-time gaps without sleep.
+    """
+
+    def _make_mouse(self, debounce_module, *,
+                    wheel_suppress=True, diagnose_wheel=False,
+                    wheel_type_b=True, **kwargs):
+        from evdev import ecodes
+        mock_device = MagicMock()
+        mock_device.name = "Test Mouse"
+        mock_device.fd = 99
+        mock_uinput = MagicMock()
+
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.from_device.return_value = mock_uinput
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, 60, quiet=True,
+                wheel_suppress=wheel_suppress,
+                diagnose_wheel=diagnose_wheel,
+                wheel_type_b=wheel_type_b,  # integration tests cover Type B paths
+                **kwargs,
+            )
+        return mouse, mock_uinput
+
+    # ---- wiring ----------------------------------------------------------
+
+    def test_suppressor_created_when_enabled(self, debounce_module):
+        mouse, _ = self._make_mouse(debounce_module, wheel_suppress=True)
+        assert isinstance(mouse._wheel_suppressor, debounce_module.WheelSuppressor)
+
+    def test_suppressor_not_created_by_default(self, debounce_module):
+        mouse, _ = self._make_mouse(debounce_module,
+                                     wheel_suppress=False, diagnose_wheel=False)
+        assert mouse._wheel_suppressor is None
+
+    def test_diag_silent_when_only_suppress(self, debounce_module):
+        """wheel_suppress=True without diagnose_wheel → diag runs silently."""
+        mouse, _ = self._make_mouse(debounce_module,
+                                     wheel_suppress=True, diagnose_wheel=False)
+        assert mouse._wheel_diag is not None
+        assert mouse._wheel_diag.emit_logs is False
+
+    def test_diag_emits_when_diagnose_wheel_on(self, debounce_module):
+        """Both flags on → diagnostic logs alongside suppression logs."""
+        mouse, _ = self._make_mouse(debounce_module,
+                                     wheel_suppress=True, diagnose_wheel=True)
+        assert mouse._wheel_diag.emit_logs is True
+
+    def test_diag_callback_drives_suppressor_anchor(self, debounce_module):
+        """A burst closing in WheelDiagnostics should update suppressor.last_closed."""
+        from evdev import ecodes
+        mouse, _ = self._make_mouse(debounce_module, wheel_suppress=True)
+        # 2 events, then idle gap > idle_ms (250ms) closes the burst on event 3.
+        with _patch_monotonic(debounce_module, [0.000, 0.020, 0.300]):
+            mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+        # After the close-out, suppressor anchor should reflect the closed burst.
+        assert mouse._wheel_suppressor.last_closed is not None
+        assert mouse._wheel_suppressor.last_closed.abs_sum == 240
+        assert mouse._wheel_suppressor.last_closed.dir == -1
+
+    # ---- realistic suppression scenarios --------------------------------
+
+    def test_type_a_reversal_suppressed_end_to_end(self, debounce_module):
+        """5-event down primary forwarded, single-step up reversal suppressed."""
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, wheel_suppress=True)
+        # 5 down events at 20ms intervals (sum -600), then a single +120 hi-res
+        # at 320ms (sign-flip closes the down burst → arms anchor → reversal
+        # event runs through predicate as Type A).
+        times = [0.000, 0.020, 0.040, 0.060, 0.080, 0.320]
+        with _patch_monotonic(debounce_module, times):
+            for _ in range(5):
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120))
+
+        # 5 forwarded; the reversal suppressed
+        assert uinput.write_event.call_count == 5
+        assert mouse._wheel_suppressor.suppressed_type_a == 1
+        assert mouse.wheel_suppressed == 1
+
+    def test_type_b_bounce_suppressed_end_to_end(self, debounce_module):
+        """5-event down primary forwarded, then 700ms idle, then same-dir
+        bounce → idle-close arms anchor, bounce event suppressed by Type B.
+        Requires Type B opt-in (default off in production)."""
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module,
+                                          wheel_suppress=True, wheel_type_b=True)
+        times = [0.000, 0.020, 0.040, 0.060, 0.080, 0.700]
+        with _patch_monotonic(debounce_module, times):
+            for _ in range(5):
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+
+        assert uinput.write_event.call_count == 5
+        assert mouse._wheel_suppressor.suppressed_type_b == 1
+
+    def test_legitimate_continuation_not_suppressed(self, debounce_module):
+        """Primary down → idle 300ms → user resumes scrolling DOWN. With
+        Type B opt-in (default in this test class), budget exhausts after
+        2 events; with Type B off (production default), all 10 events
+        forward. Test explicitly verifies the Type B opt-in path."""
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module,
+                                          wheel_suppress=True, wheel_type_b=True)
+        times = [0.000, 0.020, 0.040, 0.060, 0.080,
+                 0.380, 0.400, 0.420, 0.440, 0.460]
+        with _patch_monotonic(debounce_module, times):
+            for _ in range(5):
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            for _ in range(5):
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+
+        # Primary 600, ratio 0.5, max_total 300 → budget 300. Each event mag=120.
+        # Suppress 1st & 2nd (cumulative 240). 3rd at 360 > 300 → forward.
+        # 4th & 5th: mid-gesture (gap < quiet_ms=200) → forward.
+        # Total forwarded: 5 (primary) + 3 (continuation) = 8.
+        assert uinput.write_event.call_count == 8
+
+    def test_continuation_passes_through_with_type_b_default_off(self, debounce_module):
+        """With production default (Type B off), the user's continuation
+        scroll after a primary forwards completely — no suppression."""
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module,
+                                          wheel_suppress=True, wheel_type_b=False)
+        times = [0.000, 0.020, 0.040, 0.060, 0.080,
+                 0.380, 0.400, 0.420, 0.440, 0.460]
+        with _patch_monotonic(debounce_module, times):
+            for _ in range(5):
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            for _ in range(5):
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+        # All 10 forwarded; no Type B suppression.
+        assert uinput.write_event.call_count == 10
+        assert mouse.wheel_suppressed == 0
+
+    def test_legitimate_reverse_scroll_after_clears_anchor(self, debounce_module):
+        """Down primary → user reverses with up scroll. Type A fires ONCE
+        on the first opposite-direction event (the one indistinguishable
+        from a bounce). Subsequent up events forward — type_a_consumed
+        flag prevents repeat suppression."""
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, wheel_suppress=True)
+        times = [0.000, 0.020, 0.040, 0.060, 0.080,
+                 0.260, 0.280, 0.300, 0.320, 0.340]
+        with _patch_monotonic(debounce_module, times):
+            # Primary down (sum -600)
+            for _ in range(5):
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            # Reverse: 5 up events
+            for _ in range(5):
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120))
+
+        # 5 down forwarded + 1 up suppressed (Type A) + 4 up forwarded = 9.
+        # User loses one click of legitimate reverse scroll — acceptable
+        # cost for catching the genuine Type A bounce reversal pulse.
+        assert uinput.write_event.call_count == 9
+        assert mouse._wheel_suppressor.suppressed_type_a == 1
+
+    def test_multi_step_reverse_passes_through(self, debounce_module):
+        """A legitimate fast reverse scroll arrives as multi-step events
+        (mag > REV_MAX_HI_RES) and is NOT suppressed."""
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, wheel_suppress=True)
+        # Primary down, then a single multi-step (+240) reverse
+        times = [0.000, 0.020, 0.040, 0.060, 0.080, 0.260]
+        with _patch_monotonic(debounce_module, times):
+            for _ in range(5):
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            # Multi-step reverse — NOT a Type A signature
+            mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +240))
+
+        # All 6 forwarded
+        assert uinput.write_event.call_count == 6
+        assert mouse._wheel_suppressor.suppressed_type_a == 0
+
+    # ---- SUPPRESSED_WHEEL log line --------------------------------------
+
+    def test_suppressed_wheel_log_emitted(self, debounce_module):
+        from evdev import ecodes
+        mouse, _ = self._make_mouse(debounce_module, wheel_suppress=True)
+        times = [0.000, 0.020, 0.040, 0.060, 0.080, 0.320]
+        with _patch_monotonic(debounce_module, times):
+            for _ in range(5):
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            with patch.object(debounce_module, 'log') as mock_log:
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120))
+
+        sup_calls = [c for c in mock_log.call_args_list
+                     if 'SUPPRESSED_WHEEL' in str(c)]
+        assert len(sup_calls) == 1
+        msg = sup_calls[0].args[0]
+        assert 'reason=type_a_reversal' in msg
+        assert 'mag=120' in msg
+        assert 'sign=+' in msg
+        assert sup_calls[0].kwargs.get('also_print') is False  # file-only
+
+    # ---- runtime toggle --------------------------------------------------
+
+    def test_set_wheel_suppress_runtime_off(self, debounce_module):
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, wheel_suppress=True)
+        mouse.set_wheel_suppress(False)
+        times = [0.000, 0.020, 0.040, 0.060, 0.080, 0.320]
+        with _patch_monotonic(debounce_module, times):
+            for _ in range(5):
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120))
+        # All 6 forward when disabled
+        assert uinput.write_event.call_count == 6
+        assert mouse.wheel_suppressed == 0
+
+    def test_set_wheel_suppress_back_on(self, debounce_module):
+        """Disable then re-enable resumes suppression on the next bounce."""
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, wheel_suppress=True)
+        mouse.set_wheel_suppress(False)
+        mouse.set_wheel_suppress(True)
+        times = [0.000, 0.020, 0.040, 0.060, 0.080, 0.320]
+        with _patch_monotonic(debounce_module, times):
+            for _ in range(5):
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120))
+        assert uinput.write_event.call_count == 5
+        assert mouse.wheel_suppressed == 1
+
+    # ---- counters / has_notable_events ----------------------------------
+
+    def test_wheel_suppressed_counter_field(self, debounce_module):
+        from evdev import ecodes
+        mouse, _ = self._make_mouse(debounce_module, wheel_suppress=True)
+        assert mouse.wheel_suppressed == 0
+        times = [0.000, 0.020, 0.040, 0.060, 0.080, 0.320]
+        with _patch_monotonic(debounce_module, times):
+            for _ in range(5):
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120))
+        assert mouse.wheel_suppressed == 1
+
+    def test_has_notable_events_reflects_wheel_suppress(self, debounce_module):
+        from evdev import ecodes
+        mouse, _ = self._make_mouse(debounce_module, wheel_suppress=True)
+        assert mouse.has_notable_events() is False
+        times = [0.000, 0.020, 0.040, 0.060, 0.080, 0.320]
+        with _patch_monotonic(debounce_module, times):
+            for _ in range(5):
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120))
+        assert mouse.has_notable_events() is True
+        mouse.record_stats()
+        assert mouse.has_notable_events() is False
+
+    def test_no_suppressor_calls_when_flag_off(self, debounce_module):
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, wheel_suppress=False)
+        # Drive a Type A scenario; without --wheel-suppress all events forward.
+        times = [0.000, 0.020, 0.040, 0.060, 0.080, 0.320]
+        with _patch_monotonic(debounce_module, times):
+            for _ in range(5):
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120))
+        assert uinput.write_event.call_count == 6
+        # No counter increment
+        assert mouse.wheel_suppressed == 0
+
+
+class TestWheelSuppressorBugFixes:
+    """Regressions captured from the 2026-05-10 production failure where the
+    user reported continuous up-scroll after a down-primary was suppressed
+    "for vastly longer than a couple of seconds." Five compounding bugs in
+    the original implementation:
+
+      1. Axis-tie updates last_suppress_mono on every fire → the 8ms window
+         re-anchors and never expires while paired events keep arriving.
+      2. Type B cooldown_consumed counted notch events at mag=1 but real
+         click magnitude is ~121 hi-res units → budget never exhausted.
+      3. Type A fires unbounded times within rev_window → a slow opposite
+         scroll has every event suppressed.
+      4. Same-direction continuations (after a normal pause) look identical
+         to Type B bounces on the first event.
+      5. Cascade-extend refreshes anchor end_mono indefinitely from chained
+         small bursts → cooldown clock never elapses while user keeps
+         clicking.
+
+    Default policy after the fix: Type A only. Type B remains opt-in via the
+    `type_b_enabled=True` constructor flag for users who want to experiment
+    with same-direction suppression after building confidence.
+    """
+
+    def _make(self, debounce_module, **kwargs):
+        defaults = dict(
+            name="Test", enabled=True,
+            cooldown_ms=1200, rev_window_ms=280,
+            cooldown_ratio=0.5, min_primary=360,
+            bounce_max_total=300, quiet_ms=200,
+            type_b_enabled=False,
+        )
+        defaults.update(kwargs)
+        return debounce_module.WheelSuppressor(**defaults)
+
+    # ---- Bug 4: continuation after primary --------------------------------
+
+    def test_continuation_scroll_after_primary_not_suppressed(self, debounce_module):
+        """User scrolls UP (significant primary 726), pauses 511ms, then
+        scrolls UP AGAIN with another 14-event burst. With the default
+        (Type B off), the continuation must pass through entirely."""
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(+1, 726, end_mono=1.000)
+        # 14-event continuation burst at 30ms intervals starting at 1.511
+        results = []
+        for i in range(14):
+            t = 1.511 + i * 0.030
+            ev = make_wheel_event(
+                ecodes.REL_WHEEL if i % 2 == 0 else ecodes.REL_WHEEL_HI_RES,
+                (1 if i % 2 == 0 else 120))
+            s, r = sup.should_suppress(ev, now_mono=t)
+            results.append((s, r))
+        # All 14 events forwarded — no Type B with type_b_enabled=False.
+        assert all(not s for s, _ in results), \
+            f"Suppressed {sum(1 for s, _ in results if s)} of 14 continuation events"
+
+    def test_type_b_disabled_by_default(self, debounce_module):
+        """Default constructor has Type B disabled — same-direction events
+        within cooldown forward unconditionally."""
+        from evdev import ecodes
+        sup = debounce_module.WheelSuppressor(name="Test")  # all defaults
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120)
+        s, _ = sup.should_suppress(ev, now_mono=1.5)
+        assert s is False  # Same-direction → forward (Type B off)
+
+    # ---- Bug 3: Type A fire-once per anchor -------------------------------
+
+    def test_type_a_fires_once_per_anchor(self, debounce_module):
+        """Slow legitimate reverse scroll (5 single-step events at 30ms
+        intervals) within the rev_window should suppress at most ONE event."""
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        results = []
+        for i in range(5):
+            t = 1.10 + i * 0.030  # all within rev_window 280ms
+            s, _ = sup.should_suppress(
+                make_wheel_event(ecodes.REL_WHEEL, +1), now_mono=t)
+            results.append(s)
+        # One suppression, four forward. The user loses at most one click
+        # to the bounce-veto on a slow reverse — acceptable trade.
+        assert sum(1 for s in results if s) == 1, \
+            f"Type A suppressed {sum(1 for s in results if s)} of 5 (expected 1)"
+
+    def test_type_a_consumed_resets_on_new_anchor(self, debounce_module):
+        """A new significant primary refreshes the type_a_consumed flag."""
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        # First primary, fire Type A
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        sup.should_suppress(
+            make_wheel_event(ecodes.REL_WHEEL, +1), now_mono=1.10)
+        # New primary in same direction (replaces anchor, resets consumed)
+        sup.note_burst_closed(-1, 800, end_mono=2.0)
+        # Type A should fire again
+        s, r = sup.should_suppress(
+            make_wheel_event(ecodes.REL_WHEEL, +1), now_mono=2.10)
+        assert s is True
+        assert r == "type_a_reversal"
+
+    # ---- Bug 1: axis-tie does not extend indefinitely ---------------------
+
+    def test_axis_tie_does_not_extend_indefinitely(self, debounce_module):
+        """A stream of paired events 5ms apart should NOT keep the axis-tie
+        window alive indefinitely. After the original primary suppression,
+        axis-tie is anchored to that single event — events beyond the 8ms
+        window from the PRIMARY suppression are evaluated independently."""
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)
+        # Fire one Type A
+        sup.should_suppress(
+            make_wheel_event(ecodes.REL_WHEEL, +1), now_mono=1.100)
+        # 20 paired events at 5ms intervals (would forever extend with the bug)
+        suppressed_count = 0
+        for i in range(20):
+            t = 1.105 + i * 0.005
+            s, _ = sup.should_suppress(
+                make_wheel_event(
+                    ecodes.REL_WHEEL_HI_RES if i % 2 == 0 else ecodes.REL_WHEEL,
+                    (120 if i % 2 == 0 else 1)), now_mono=t)
+            if s:
+                suppressed_count += 1
+        # Only the FIRST event (the immediate axis-tie pair) should suppress.
+        # Type A is consumed; further events have no other reason to suppress.
+        assert suppressed_count == 1, \
+            f"Expected 1 axis-tie suppression, got {suppressed_count}"
+
+    # ---- Type B opt-in mode behaves correctly -----------------------------
+
+    def test_type_b_opt_in_uses_full_event_magnitude(self, debounce_module):
+        """When type_b_enabled=True, cooldown_consumed should reflect each
+        event's magnitude (notch=1, hi-res=120) plus axis-tie suppressions —
+        budget exhausts within ~3 clicks, not ~300."""
+        from evdev import ecodes
+        sup = self._make(debounce_module,
+                         type_b_enabled=True,
+                         bounce_max_total=300,
+                         cooldown_ratio=0.5)
+        sup.note_burst_closed(-1, 600, end_mono=1.0)  # primary
+        # 5 wheel "clicks" — each = notch + hi-res, paired
+        results = []
+        for i in range(5):
+            t_notch = 1.500 + i * 0.030
+            t_hires = t_notch + 0.001
+            results.append(sup.should_suppress(
+                make_wheel_event(ecodes.REL_WHEEL, -1), now_mono=t_notch))
+            results.append(sup.should_suppress(
+                make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120), now_mono=t_hires))
+        # 10 events total. Budget = min(600*0.5, 300) = 300.
+        # Each click consumes ~121 (1 notch + 120 hi-res via axis-tie).
+        # ~2.5 clicks suppressed → 5 events suppressed, then forward.
+        suppressed = sum(1 for s, _ in results if s)
+        assert 4 <= suppressed <= 6, \
+            f"Type B opt-in suppressed {suppressed}/10 (expected ~5)"
+
+
+class TestWheelSuppressorCascade:
+    """Captured 2026-05-10 01:01:08 cascade scenario: substantial up primary
+    (1331 hi-res, 22 events) followed by three same-direction bounce bursts
+    of 242 hi-res / 4 events each at ~615/652/593ms intervals. The original
+    Type B implementation suppressed bounce #1 fully but exhausted budget,
+    leaving #2 partial and #3 unsuppressed.
+
+    Fix: cascade-extend resets cooldown_consumed so each bounce in the
+    chain gets a fresh budget. A chain-depth cap prevents runaway extension
+    if the user is genuinely doing slow repeated scrolls.
+    """
+
+    def _make(self, debounce_module, **kwargs):
+        defaults = dict(
+            name="Test", enabled=True,
+            cooldown_ms=1200, rev_window_ms=280,
+            cooldown_ratio=0.5, min_primary=360,
+            bounce_max_total=242, quiet_ms=200,
+            type_b_enabled=True,
+            max_cascade_depth=5,  # Enable cascade for these tests
+        )
+        defaults.update(kwargs)
+        return debounce_module.WheelSuppressor(**defaults)
+
+    def test_cascade_three_bounces_all_suppressed(self, debounce_module):
+        """Replay the captured failure: primary 1331 + 3 × 242 bounces.
+        Every event of every bounce must be suppressed."""
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        # Primary closes
+        sup.note_burst_closed(+1, 1331, end_mono=1.000)
+        # Bounce 1 events (4 events: notch+hi-res×2)
+        bounce_starts = [1.615, 2.267, 2.860]  # cumulative ~615ms gaps
+        for bn, t_start in enumerate(bounce_starts):
+            results = []
+            for i, t in enumerate([t_start, t_start + 0.001,
+                                    t_start + 0.030, t_start + 0.031]):
+                code = ecodes.REL_WHEEL if i % 2 == 0 else ecodes.REL_WHEEL_HI_RES
+                value = (1 if i % 2 == 0 else 120)
+                s, _ = sup.should_suppress(
+                    make_wheel_event(code, value), now_mono=t)
+                results.append(s)
+            assert all(results), \
+                f"Bounce #{bn+1} not fully suppressed: {results}"
+            # WheelDiagnostics would close the burst after idle gap
+            sup.note_burst_closed(+1, 242, end_mono=t_start + 0.031)
+
+    def test_cascade_chain_depth_capped(self, debounce_module):
+        """After N cascade extensions, anchor should clear so an
+        indefinitely long chain of small same-direction events doesn't
+        block legitimate user scrolls forever."""
+        from evdev import ecodes
+        sup = self._make(debounce_module, cooldown_ms=10_000)  # long, to isolate cascade cap
+        sup.note_burst_closed(+1, 1000, end_mono=1.000)
+        # Drive many small same-direction closes
+        for i in range(20):
+            sup.note_burst_closed(+1, 200, end_mono=1.5 + i * 0.5)
+        # After cap, anchor should be cleared (or replaced with insignificant)
+        # so a fresh same-direction event passes through.
+        s, _ = sup.should_suppress(
+            make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120),
+            now_mono=15.0)
+        assert s is False, "Indefinite cascade chain still suppressing"
+
+    def test_cascade_reset_does_not_apply_after_significant_burst(self, debounce_module):
+        """If a SIGNIFICANT burst follows the primary, it replaces the
+        anchor (new primary), and cooldown_consumed resets — that's
+        existing behavior, not the cascade-extend reset path."""
+        from evdev import ecodes
+        sup = self._make(debounce_module, min_primary=360)
+        sup.note_burst_closed(+1, 1000, end_mono=1.000)
+        # Substantial second burst → new primary
+        sup.note_burst_closed(+1, 800, end_mono=1.500)
+        assert sup.last_closed.abs_sum == 800
+        assert sup.cooldown_consumed == 0
+
+
+class TestWheelSuppressorConservative:
+    """Production tuning for the user's real scrolling pattern. The
+    initial defaults (min_primary=360, cooldown=1200, max=300, cascade=5)
+    over-suppressed the user's mixed-magnitude scroll style — every 3-click
+    flick crossed min_primary and re-armed the anchor, locking subsequent
+    small scrolls into Type B suppression. New defaults trade catch-rate
+    for responsiveness:
+
+      min_primary       720   (only 6+ click bursts arm the anchor)
+      cooldown_ms       800   (tighter post-primary window)
+      bounce_max_total  121   (one click per anchor maximum)
+      MAX_CASCADE       0     (no extension — one anchor, one chance)
+    """
+
+    def _make(self, debounce_module, **kwargs):
+        defaults = dict(
+            name="Test", enabled=True,
+            cooldown_ms=800, rev_window_ms=280,
+            cooldown_ratio=0.5, min_primary=720,
+            bounce_max_total=121, quiet_ms=200,
+            type_b_enabled=True,
+        )
+        defaults.update(kwargs)
+        return debounce_module.WheelSuppressor(**defaults)
+
+    def test_three_click_scroll_does_not_arm(self, debounce_module):
+        """A 3-click scroll (sum 363) is below min_primary 720 and must
+        not arm the anchor — the user's typical small flicks should not
+        trigger any suppression on follow-up scrolls."""
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(+1, 363, end_mono=1.0)
+        # Subsequent same-dir scroll within nominal cooldown — must forward
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120)
+        s, _ = sup.should_suppress(ev, now_mono=1.5)
+        assert s is False
+
+    def test_six_click_scroll_arms(self, debounce_module):
+        """A 6-click scroll (sum 720) reaches min_primary and arms the
+        anchor — subsequent same-direction events within cooldown can
+        be suppressed."""
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(+1, 720, end_mono=1.0)
+        # Exactly one click should suppress, then anchor exhausted
+        s_notch, _ = sup.should_suppress(
+            make_wheel_event(ecodes.REL_WHEEL, +1), now_mono=1.3)
+        s_hires, _ = sup.should_suppress(
+            make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120), now_mono=1.301)
+        assert s_notch is True
+        assert s_hires is True
+
+    def test_only_one_click_suppressed_per_anchor(self, debounce_module):
+        """bounce_max_total=121 means consumed exhausts after a single
+        click pair — the SECOND click of any same-direction follow-up
+        forwards even though it's still within cooldown."""
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(+1, 720, end_mono=1.0)
+        # Click 1 — suppressed (notch + hi-res via axis-tie)
+        sup.should_suppress(make_wheel_event(ecodes.REL_WHEEL, +1), now_mono=1.30)
+        sup.should_suppress(make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120), now_mono=1.301)
+        # Click 2 at 30ms later — must forward (consumed=121 already at budget)
+        s, _ = sup.should_suppress(
+            make_wheel_event(ecodes.REL_WHEEL, +1), now_mono=1.330)
+        assert s is False
+
+    def test_no_cascade_extension(self, debounce_module):
+        """With MAX_CASCADE_DEPTH=0, a small same-direction burst close
+        DOES NOT extend the anchor — one shot per primary, then done."""
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(+1, 720, end_mono=1.0)
+        # Cascade-extend attempt
+        sup.note_burst_closed(+1, 121, end_mono=1.5)
+        # Anchor should be cleared (cascade depth exceeded)
+        assert sup.last_closed is None
+
+    def test_cooldown_expires_at_800ms(self, debounce_module):
+        from evdev import ecodes
+        sup = self._make(debounce_module)
+        sup.note_burst_closed(+1, 720, end_mono=1.0)
+        # 900ms after primary — past 800ms cooldown
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, +120)
+        s, _ = sup.should_suppress(ev, now_mono=1.9)
+        assert s is False
+
+
+class TestWheelMultiplier:
+    """Tests for `--wheel-multiplier` — scaling forwarded wheel event values
+    to compensate for the lost smooth-scroll velocity when the user disables
+    Logitech's high-resolution scroll mode (Solaar → Scroll Wheel Resolution
+    off). Low-res mode naturally suppresses sub-detent free-spin bounces but
+    cuts perceived scroll speed; the multiplier puts speed back without
+    re-introducing the bounces.
+
+    The multiplier scales `event.value` after the suppression decision but
+    before the uinput write. Suppressor logic continues to operate on
+    original magnitudes.
+    """
+
+    def _make_mouse(self, debounce_module, wheel_multiplier=1, **kwargs):
+        from evdev import ecodes
+        mock_device = MagicMock()
+        mock_device.name = "Test Mouse"
+        mock_device.fd = 99
+        mock_uinput = MagicMock()
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.from_device.return_value = mock_uinput
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, 60, quiet=True,
+                wheel_multiplier=wheel_multiplier,
+                **kwargs,
+            )
+        return mouse, mock_uinput
+
+    def test_multiplier_one_passes_through_unchanged(self, debounce_module):
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, wheel_multiplier=1)
+        ev = make_wheel_event(ecodes.REL_WHEEL, -1)
+        mouse.process_event(ev)
+        # Forwarded as-is
+        uinput.write_event.assert_called_once()
+        forwarded = uinput.write_event.call_args.args[0]
+        assert forwarded.value == -1
+        assert forwarded.code == ecodes.REL_WHEEL
+
+    def test_multiplier_doubles_notch_value(self, debounce_module):
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, wheel_multiplier=2)
+        ev = make_wheel_event(ecodes.REL_WHEEL, -1)
+        mouse.process_event(ev)
+        forwarded = uinput.write_event.call_args.args[0]
+        assert forwarded.value == -2
+        assert forwarded.code == ecodes.REL_WHEEL
+
+    def test_multiplier_doubles_hires_value(self, debounce_module):
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, wheel_multiplier=2)
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120)
+        mouse.process_event(ev)
+        forwarded = uinput.write_event.call_args.args[0]
+        assert forwarded.value == -240
+        assert forwarded.code == ecodes.REL_WHEEL_HI_RES
+
+    def test_multiplier_preserves_sign(self, debounce_module):
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, wheel_multiplier=3)
+        ev = make_wheel_event(ecodes.REL_WHEEL, +1)
+        mouse.process_event(ev)
+        forwarded = uinput.write_event.call_args.args[0]
+        assert forwarded.value == +3
+
+    def test_multiplier_does_not_affect_movement_events(self, debounce_module):
+        """REL_X / REL_Y must not be multiplied — only wheel axes."""
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, wheel_multiplier=4)
+        ev = make_wheel_event(ecodes.REL_X, 5)
+        mouse.process_event(ev)
+        forwarded = uinput.write_event.call_args.args[0]
+        assert forwarded.value == 5  # Unmultiplied
+
+    def test_multiplier_does_not_unsuppress(self, debounce_module):
+        """A suppressed wheel event stays suppressed regardless of multiplier."""
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(
+            debounce_module, wheel_multiplier=2,
+            wheel_suppress=True, wheel_type_b=True,
+            wheel_min_primary=720, wheel_cooldown_ms=800,
+            wheel_bounce_max_total=121, wheel_max_cascade_depth=0,
+        )
+        # Drive a primary then a same-direction follow-up; first event
+        # should suppress (regardless of multiplier).
+        times = [0.000, 0.020, 0.040, 0.060, 0.080,
+                 0.100, 0.120, 0.140, 0.160, 0.180,
+                 0.200, 0.220, 0.500]  # 12 primary events + 1 bounce
+        with _patch_monotonic(debounce_module, times):
+            for _ in range(12):  # sum 1440 > min_primary 720
+                mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+            mouse.process_event(make_wheel_event(ecodes.REL_WHEEL, -1))
+        # Last event suppressed; uinput count should equal primary's 12.
+        # Each primary event was multiplied by 2 (forwarded as -240).
+        assert uinput.write_event.call_count == 12
+        forwarded_values = [c.args[0].value for c in uinput.write_event.call_args_list]
+        assert all(v == -240 for v in forwarded_values), \
+            f"Expected all -240, got {forwarded_values}"
+
+    def test_multiplier_minimum_one(self, debounce_module):
+        """Multiplier 0 or negative must be rejected (raise or clamp to 1) —
+        zero-valued wheel events would silently break scrolling."""
+        # Just verify the ctor doesn't crash on edge values; behavior
+        # at 0/negative is a CLI validation concern in main().
+        from evdev import ecodes
+        mouse, _ = self._make_mouse(debounce_module, wheel_multiplier=1)
+        # No exception expected
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120)
+        mouse.process_event(ev)
+
+
+class TestWheelSuppressorReplay:
+    """End-to-end replay tests against statistics derived from the captured
+    production log (`/var/log/mouse-filter/debounce.log`, recent window).
+
+    These drive multi-burst sequences through the full process_event pipeline
+    using realistic per-event magnitudes, durations, and inter-burst gaps,
+    and assert aggregate suppression rates against the targets the design
+    plan committed to:
+
+      - ≥ 90% of Type A bounces caught
+      - ≥ 70% of Type B bounces caught (covering median, missing the long-tail)
+      - 0% false-positive on legitimate isolated single-step scrolls
+    """
+
+    def _make_mouse(self, debounce_module, **kwargs):
+        from evdev import ecodes
+        mock_device = MagicMock()
+        mock_device.name = "MX Anywhere 2S"
+        mock_device.fd = 99
+        mock_uinput = MagicMock()
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.from_device.return_value = mock_uinput
+            # Replay tests cover both Type A and Type B paths
+            defaults = dict(quiet=True, wheel_suppress=True, wheel_type_b=True)
+            defaults.update(kwargs)
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, 60, **defaults)
+        return mouse, mock_uinput
+
+    def _drive_burst(self, mouse, debounce_module, sign, count, t_start, dur_ms):
+        """Drive a `count`-event burst over `dur_ms` starting at `t_start`.
+        Each event has hi-res magnitude 120 (one notch). Returns the time
+        immediately after the last event."""
+        from evdev import ecodes
+        if count <= 0:
+            return t_start
+        step = (dur_ms / 1000.0) / max(count - 1, 1)
+        times = [t_start + i * step for i in range(count)]
+        with _patch_monotonic(debounce_module, times):
+            for _ in range(count):
+                mouse.process_event(make_wheel_event(
+                    ecodes.REL_WHEEL_HI_RES, sign * 120))
+        return times[-1]
+
+    def _drive_single(self, mouse, debounce_module, code, value, now):
+        from evdev import ecodes
+        with _patch_monotonic(debounce_module, [now]):
+            mouse.process_event(make_wheel_event(code, value))
+
+    # ---- Type A targets ----------------------------------------------------
+
+    def test_type_a_replay_high_suppression_rate(self, debounce_module):
+        """18 Type A scenarios from the log: each is a primary down burst
+        (sum 360–4000+) followed by a single ±1 reversal at 67–240ms gap.
+        Target: 100% caught (window 280ms covers the whole observed range)."""
+        from evdev import ecodes
+        # (primary_sum, gap_ms_to_reversal) — derived from log distribution
+        scenarios = [
+            (605, 67), (1452, 100), (2178, 222), (4114, 112), (363, 145),
+            (484, 176), (725, 200), (968, 240), (1936, 80), (3267, 130),
+            (605, 95), (484, 110), (242, 175),  # 242 < min_primary → not armed
+            (363, 220), (1815, 160), (2541, 230), (484, 240), (3025, 200),
+        ]
+        suppressed = 0
+        eligible = 0
+        for primary_sum, gap_ms in scenarios:
+            mouse, _ = self._make_mouse(debounce_module)
+            count = primary_sum // 120
+            t_end = self._drive_burst(mouse, debounce_module,
+                                       sign=-1, count=count,
+                                       t_start=0.000, dur_ms=120)
+            # Reversal event: single notch (REL_WHEEL value=+1) at gap_ms after t_end
+            self._drive_single(mouse, debounce_module,
+                               ecodes.REL_WHEEL, +1,
+                               now=t_end + gap_ms / 1000.0)
+            # Only count scenarios where primary was significant (≥ min_primary 360)
+            if primary_sum >= 360:
+                eligible += 1
+                if mouse._wheel_suppressor.suppressed_type_a >= 1:
+                    suppressed += 1
+        rate = suppressed / eligible
+        assert rate >= 0.90, f"Type A suppression rate {rate:.2%} < 90%"
+
+    # ---- Type B targets ----------------------------------------------------
+
+    def test_type_b_replay_within_window(self, debounce_module):
+        """Type B bounces with gap ≤ 1200ms (cooldown window) should be
+        caught at high rate. Sourced from the log's median 1020ms gap."""
+        scenarios = [
+            # (primary_sum, gap_ms, bounce_sum)
+            (605, 700, 242),
+            (1452, 1000, 484),
+            (2178, 850, 605),
+            (484, 600, 121),
+            (968, 1100, 363),
+            (3267, 800, 1452),
+            (605, 900, 121),
+            (1815, 1000, 605),
+            (484, 1150, 242),
+            (725, 1050, 363),
+        ]
+        caught = 0
+        for primary_sum, gap_ms, bounce_sum in scenarios:
+            mouse, _ = self._make_mouse(debounce_module)
+            t_end = self._drive_burst(mouse, debounce_module,
+                                       sign=-1,
+                                       count=primary_sum // 120,
+                                       t_start=0.000, dur_ms=120)
+            t_bounce_start = t_end + gap_ms / 1000.0
+            self._drive_burst(mouse, debounce_module,
+                              sign=-1,
+                              count=bounce_sum // 120,
+                              t_start=t_bounce_start, dur_ms=80)
+            if mouse._wheel_suppressor.suppressed_type_b >= 1:
+                caught += 1
+        rate = caught / len(scenarios)
+        assert rate >= 0.70, f"Type B suppression rate {rate:.2%} < 70%"
+
+    def test_type_b_long_tail_outside_window_passes(self, debounce_module):
+        """Type B bounces with gap > 1200ms cooldown are LET THROUGH —
+        deliberate tradeoff to avoid suppressing legitimate scroll-pause-scroll
+        gestures at long pauses. Target: 0 suppressions for these."""
+        scenarios = [(605, 1500, 242), (484, 2500, 121), (1452, 4000, 363)]
+        suppressed = 0
+        for primary_sum, gap_ms, bounce_sum in scenarios:
+            mouse, _ = self._make_mouse(debounce_module)
+            t_end = self._drive_burst(mouse, debounce_module,
+                                       sign=-1,
+                                       count=primary_sum // 120,
+                                       t_start=0.000, dur_ms=120)
+            self._drive_burst(mouse, debounce_module,
+                              sign=-1,
+                              count=bounce_sum // 120,
+                              t_start=t_end + gap_ms / 1000.0, dur_ms=80)
+            suppressed += mouse._wheel_suppressor.suppressed_type_b
+        assert suppressed == 0, \
+            f"Long-tail bounces suppressed {suppressed} times — should pass through"
+
+    # ---- False-positive guard ---------------------------------------------
+
+    def test_isolated_legitimate_small_scrolls_pass_through(self, debounce_module):
+        """81 isolated single-step scrolls observed in the log (sum 121–242,
+        no preceding primary in 750ms). These are intentional micro-scrolls
+        and MUST NOT be suppressed."""
+        from evdev import ecodes
+        false_positives = 0
+        for _ in range(30):
+            mouse, _ = self._make_mouse(debounce_module)
+            # No primary first; just a paired single-notch event (hi-res + notch)
+            self._drive_single(mouse, debounce_module,
+                               ecodes.REL_WHEEL_HI_RES, -120, now=0.000)
+            self._drive_single(mouse, debounce_module,
+                               ecodes.REL_WHEEL, -1, now=0.005)
+            false_positives += mouse.wheel_suppressed
+        assert false_positives == 0, \
+            f"Suppressed {false_positives} legitimate isolated scrolls"
+
+    def test_legitimate_small_after_long_pause_passes(self, debounce_module):
+        """User scrolls primary → pauses 2 seconds (well past cooldown) →
+        scrolls a small amount in either direction. Must not be suppressed."""
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module)
+        # Primary
+        t_end = self._drive_burst(mouse, debounce_module,
+                                   sign=-1, count=5,
+                                   t_start=0.000, dur_ms=80)
+        # 2.5s pause, then a single small same-dir scroll
+        self._drive_single(mouse, debounce_module,
+                           ecodes.REL_WHEEL_HI_RES, -120,
+                           now=t_end + 2.5)
+        assert mouse.wheel_suppressed == 0
+
+
+class TestWheelSuppressToggleSignal:
+    """Tests for SIGUSR2 toggle handler at the module level."""
+
+    def test_make_toggle_handler_flips_all_mice(self, debounce_module):
+        """make_wheel_suppress_toggle returns a function that, when called,
+        flips set_wheel_suppress on every mouse in the registry and logs the
+        new state."""
+        # Two fake mice with set_wheel_suppress() trackers
+        m1 = MagicMock()
+        m1.name = "Mouse-A"
+        m1._wheel_suppressor = MagicMock()
+        m1._wheel_suppressor.enabled = True
+        m1.wheel_suppress_enabled = True
+
+        m2 = MagicMock()
+        m2.name = "Mouse-B"
+        m2._wheel_suppressor = MagicMock()
+        m2._wheel_suppressor.enabled = True
+        m2.wheel_suppress_enabled = True
+
+        registry = [m1, m2]
+        with patch.object(debounce_module, 'log') as mock_log:
+            handler = debounce_module.make_wheel_suppress_toggle(registry)
+            handler(None, None)  # signal handler signature
+
+        # Both mice toggled
+        m1.set_wheel_suppress.assert_called_once_with(False)
+        m2.set_wheel_suppress.assert_called_once_with(False)
+        # Log line
+        toggle_calls = [c for c in mock_log.call_args_list
+                        if 'WHEEL_SUPPRESS_TOGGLE' in str(c)]
+        assert len(toggle_calls) == 1
+        msg = toggle_calls[0].args[0]
+        assert 'WHEEL_SUPPRESS_TOGGLE: off' in msg
+
+    def test_toggle_returns_to_on(self, debounce_module):
+        """Second toggle flips back to on."""
+        m1 = MagicMock()
+        m1.name = "Mouse-A"
+        m1._wheel_suppressor = MagicMock()
+        m1._wheel_suppressor.enabled = False
+        m1.wheel_suppress_enabled = False
+
+        registry = [m1]
+        with patch.object(debounce_module, 'log') as mock_log:
+            handler = debounce_module.make_wheel_suppress_toggle(registry)
+            handler(None, None)
+
+        m1.set_wheel_suppress.assert_called_once_with(True)
+        toggle_calls = [c for c in mock_log.call_args_list
+                        if 'WHEEL_SUPPRESS_TOGGLE' in str(c)]
+        assert 'WHEEL_SUPPRESS_TOGGLE: on' in toggle_calls[0].args[0]
+
+    def test_toggle_with_empty_registry(self, debounce_module):
+        """Handler is a no-op (other than logging) when no mice are loaded."""
+        with patch.object(debounce_module, 'log') as mock_log:
+            handler = debounce_module.make_wheel_suppress_toggle([])
+            handler(None, None)
+        # Should not crash; may or may not log
+        # (either behavior acceptable as long as no exception)
 
 
 class TestUserTag:

@@ -5,6 +5,7 @@
 A collection of mouse management utilities for Linux, built on evdev. A single `mouse-filter` daemon handles:
 - **Button remapping** — Remaps mouse buttons to keyboard keys (e.g., forward/back → volume up/down). Replaces input-remapper for simple mouse button remaps with zero additional overhead.
 - **Button debounce (opt-in via `--debounce`)** — Suppresses hardware switch bounce (worn Omron micro-switches) that causes phantom releases during drags and false double-clicks. Off by default; the current production mouse hardware does not bounce. The code path is preserved so it can be re-enabled if a future mouse needs it.
+- **Wheel-bounce suppression (opt-in via `--wheel-suppress`)** — Drops Type A (single-step sign-flip reversal) and Type B (same-direction re-burst) hardware rebounds on smooth-scroll wheels (Logitech MX 2 with detents disabled). Tunable via `--wheel-cooldown-ms`, `--wheel-cooldown-ratio`, `--wheel-min-primary`, `--wheel-bounce-max-total`, `--wheel-rev-window-ms`, `--wheel-quiet-ms`. Toggle live via `mouse-suppress on|off|toggle` (SIGUSR2 — auth-free via the polkit rule install.sh deploys).
 
 ## Architecture
 
@@ -55,6 +56,8 @@ Configure via `--remap SRC=DST` CLI flag (repeatable).
 | `CLICK_DIAG` | Per-click decision logging (--diagnose-clicks only) | File only (not stdout) |
 | `WHEEL_REV` | Wheel scroll direction reversal — candidate rebound (--diagnose-wheel only) | File only (not stdout) |
 | `WHEEL_BURST_END` | Wheel burst closed out after idle gap (--diagnose-wheel only) | File only (not stdout) |
+| `SUPPRESSED_WHEEL` | Wheel event dropped by suppression filter. Includes reason (type_a_reversal / type_b_cooldown / axis_tie), magnitude, age from primary, primary sum (--wheel-suppress only) | File only (not stdout) |
+| `WHEEL_SUPPRESS_TOGGLE` | Suppression state change (on\|off). Emitted at startup and on each SIGUSR2. `mouse-suppress status` reads this. | Both |
 | `USER_TAG` | User marker emitted on SIGUSR1 (panel launcher hook). Always emits when received. Triggered via `systemctl kill -s SIGUSR1 mouse-filter.service` (auth-free for invoking user via the polkit rule install.sh deploys). | Both (also stdout) |
 | Startup config | Full configuration banner | File only in --quiet; both otherwise |
 
@@ -86,7 +89,9 @@ The log file (`~/.local/share/mouse-filter/debounce.log` or `--log-dir`) is capp
 
 - **`DelayedDebouncedMouse`** — The production implementation. Handles remapping, immediate click releases, delayed drag releases, bounce suppression. This is the one that matters.
 - **`MoveDiagnostics`** — Per-interval movement pipeline telemetry. Tracks 4 stages: input delivery lag/Hz, batch sizes, loop iteration time, uinput write latency. Also holds `x11_stalls` counter written by X11PointerProbe. Created per-mouse only when `--diagnose-move` is active.
-- **`WheelDiagnostics`** — Wheel-event burst classifier and reversal logger. Per-mouse state machine that groups REL_WHEEL/REL_WHEEL_HI_RES events into directional bursts; emits `WHEEL_REV` on sign-flip events and `WHEEL_BURST_END` on idle close-out. Read-only; never modifies the forwarded event stream. Created per-mouse only when `--diagnose-wheel` is active. Built to characterize wheel rebound on smooth-scroll wheels (e.g., Logitech MX Master / MX 2) before deciding on a suppression policy.
+- **`WheelDiagnostics`** — Wheel-event burst classifier. Per-mouse state machine that groups REL_WHEEL/REL_WHEEL_HI_RES events into directional bursts; emits `WHEEL_REV` on sign-flip events and `WHEEL_BURST_END` on idle close-out (when `emit_logs=True`). Fires `on_burst_closed(dir, abs_sum, end_mono)` callback on every burst close — the integration point that drives `WheelSuppressor`'s anchor. Created per-mouse when `--diagnose-wheel` OR `--wheel-suppress` is active; runs silent (no log emission) when only suppression is on.
+- **`WheelSuppressor`** — Active wheel-bounce suppression. Two rules: Type A (single-step opposite-direction reversal within `rev_window_ms`) and Type B (same-direction re-burst within `cooldown_ms`, magnitude-bounded by `min(primary*ratio, bounce_max_total)`). Anchor managed via the WheelDiagnostics callback: same-direction small bursts extend the cooldown (cascade-decay handling); cross-direction small bursts clear the anchor (legitimate reverse). Mid-gesture guard prevents false-positives during continuous scrolling. Axis-tie keeps `REL_WHEEL` and `REL_WHEEL_HI_RES` paired. Hot-path cost is O(1). `set_enabled(b)` is the runtime toggle entry point — driven by `make_wheel_suppress_toggle` SIGUSR2 handler.
+- **`_ClosedBurst`** — Plain `__slots__` record holding `(dir, abs_sum, end_mono, was_significant)`. Mutable on purpose: cascade-extension updates `end_mono` in place to extend the cooldown anchor across decay-stage bounces.
 - **`X11PointerProbe`** — Daemon thread polling `XQueryPointer` at 200Hz to detect downstream pointer stalls. If events are forwarded but the pointer hasn't moved for 50ms, logs an `x11_stall`. Gracefully degrades when `$DISPLAY` unavailable.
 - **`DebouncedMouse`** — Earlier approach (suppress on re-press, no release delay). Kept for reference but not used. Can be removed.
 - **`FocusMonitor`** (in drag-monitor) — Watches `_NET_ACTIVE_WINDOW` via xprop.
@@ -126,11 +131,20 @@ sudo ./run.sh --diagnose-move --stats-interval 30
 
 ### Run manually
 ```bash
-sudo ./run.sh                                    # default: remaps only, debounce off
+sudo ./run.sh                                    # default: remaps + wheel-suppress + diagnose-wheel
 sudo ./run.sh --quiet                            # production mode
 sudo ./run.sh --debounce --threshold 70          # enable debounce (bouncy hardware)
-sudo ./mouse-filter --debounce --threshold 70    # direct invocation, debounce only
+sudo ./mouse-filter --wheel-suppress             # direct invocation, suppress only
 ```
+
+### Toggle wheel suppression at runtime
+```bash
+mouse-suppress status     # current state (on|off|unknown)
+mouse-suppress off        # disable without restart, no auth prompt
+mouse-suppress on         # re-enable
+mouse-suppress            # plain toggle
+```
+Sends SIGUSR2 to the daemon; the polkit rule installed by install.sh permits this for the active console user without auth.
 
 ### Install as systemd service
 ```bash
