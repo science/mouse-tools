@@ -77,18 +77,15 @@ After=multi-user.target
 
 [Service]
 Type=simple
-# Debounce is OFF by default. To re-enable for bouncy hardware,
-# append: --debounce --threshold 70
-# Wheel suppression has been DISABLED in favor of the Solaar
-# "Scroll Wheel Resolution OFF" hardware setting — that change makes
-# the wheel ignore sub-detent free-spin bounces at the firmware level,
-# eliminating the artifacts that --wheel-suppress was filtering. The
-# code paths remain available; to re-enable add --wheel-suppress (and
-# optionally --wheel-type-b) below.
-# --wheel-multiplier 3 compensates for the lost smooth-scroll velocity
-# in low-res mode. --diagnose-wheel keeps WHEEL_REV / WHEEL_BURST_END
-# logging for ongoing visibility into wheel behavior.
-ExecStart=$INSTALL_BIN --quiet --wheel-multiplier 3 --diagnose-wheel --log-dir $LOG_DIR --remap BTN_EXTRA=KEY_VOLUMEUP --remap BTN_SIDE=KEY_VOLUMEDOWN --remap BTN_MIDDLE=KEY_MUTE
+# Debounce: ON at 70ms — older MX Anywhere 2S unit shows wear-driven
+# Omron left-click bounce (drag-select gets reset by phantom release+
+# re-press within ~40-70ms). Drop --debounce to disable.
+# Wheel: stock — no multiplier, no suppress, no drop-hires.
+# Currently running a second MX Anywhere 2S unit (the first had
+# sub-detent pre-roll phantoms). --diagnose-wheel preserved as
+# read-only observability so the second unit can be evaluated
+# against the same WHEEL_REV / WHEEL_BURST_END data.
+ExecStart=$INSTALL_BIN --quiet --debounce --threshold 70 --diagnose-wheel --log-dir $LOG_DIR --remap BTN_EXTRA=KEY_VOLUMEUP --remap BTN_SIDE=KEY_VOLUMEDOWN --remap BTN_MIDDLE=KEY_MUTE
 Restart=on-failure
 RestartSec=3
 

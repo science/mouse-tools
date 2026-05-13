@@ -2,15 +2,15 @@
 # Quick-launch mouse-filter with standard volume remap config.
 # Usage: sudo ./run.sh
 #
-# Debounce is OFF by default. To re-enable for hardware with bouncing
-# switches, add: --debounce --threshold 70
+# Debounce: ON at 70ms — older MX Anywhere 2S unit shows wear-driven
+# Omron left-click bounce. Drop --debounce to disable.
 #
-# Wheel-bounce suppression is ON by default for the MX 2 smooth-scroll
-# rebound problem. Pass --wheel-suppress=false (or omit and remove
-# --wheel-suppress) to disable for ad-hoc runs.
+# Wheel: stock — no multiplier, no suppress, no drop-hires.
+# --diagnose-wheel preserved for read-only WHEEL_REV / WHEEL_BURST_END
+# logging while evaluating a replacement MX Anywhere 2S unit.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec "$SCRIPT_DIR/mouse-filter" \
-    --wheel-multiplier 3 \
+    --debounce --threshold 70 \
     --diagnose-wheel \
     --remap BTN_EXTRA=KEY_VOLUMEUP \
     --remap BTN_SIDE=KEY_VOLUMEDOWN \
