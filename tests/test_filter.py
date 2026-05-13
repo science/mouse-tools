@@ -3267,6 +3267,97 @@ class TestWheelMultiplier:
         mouse.process_event(ev)
 
 
+class TestWheelDropHires:
+    """Tests for `--wheel-drop-hires` — drop REL_WHEEL_HI_RES events at the
+    filter so only notch (REL_WHEEL) events reach uinput. Pairs with Solaar's
+    low-res scroll mode to truly deliver a "low-res sensor only" experience:
+    sub-detent hi-res phantoms (encoder noise, mechanical micro-rebounds) are
+    eliminated entirely because they have no notch event behind them.
+    """
+
+    def _make_mouse(self, debounce_module, drop_hires=False, **kwargs):
+        from evdev import ecodes
+        mock_device = MagicMock()
+        mock_device.name = "Test Mouse"
+        mock_device.fd = 99
+        mock_uinput = MagicMock()
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.from_device.return_value = mock_uinput
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, 60, quiet=True,
+                wheel_drop_hires=drop_hires,
+                **kwargs,
+            )
+        return mouse, mock_uinput
+
+    def test_default_off_hires_forwarded(self, debounce_module):
+        """Backwards compat: when flag absent, hi-res still forwarded."""
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module)
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120)
+        mouse.process_event(ev)
+        uinput.write_event.assert_called_once()
+
+    def test_drop_hires_drops_hires_events(self, debounce_module):
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, drop_hires=True)
+        ev = make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120)
+        mouse.process_event(ev)
+        uinput.write_event.assert_not_called()
+
+    def test_drop_hires_forwards_notch_events(self, debounce_module):
+        """REL_WHEEL must still be forwarded — only the hi-res axis is dropped."""
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, drop_hires=True)
+        ev = make_wheel_event(ecodes.REL_WHEEL, -1)
+        mouse.process_event(ev)
+        uinput.write_event.assert_called_once()
+        forwarded = uinput.write_event.call_args.args[0]
+        assert forwarded.code == ecodes.REL_WHEEL
+        assert forwarded.value == -1
+
+    def test_drop_hires_with_multiplier_still_multiplies_notch(self, debounce_module):
+        """Multiplier still applies to the surviving notch event."""
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(
+            debounce_module, drop_hires=True, wheel_multiplier=3,
+        )
+        mouse.process_event(make_wheel_event(ecodes.REL_WHEEL, -1))
+        mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -120))
+        # Only the notch survives; multiplier 3 → -3
+        assert uinput.write_event.call_count == 1
+        forwarded = uinput.write_event.call_args.args[0]
+        assert forwarded.code == ecodes.REL_WHEEL
+        assert forwarded.value == -3
+
+    def test_drop_hires_does_not_affect_non_wheel_events(self, debounce_module):
+        """REL_X / REL_Y must not be dropped — only the hi-res wheel axis."""
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, drop_hires=True)
+        mouse.process_event(make_wheel_event(ecodes.REL_X, 10))
+        mouse.process_event(make_wheel_event(ecodes.REL_Y, -5))
+        assert uinput.write_event.call_count == 2
+
+    def test_drop_hires_preserves_diagnostics(self, debounce_module):
+        """WheelDiagnostics must still observe the dropped events so the
+        BURST_END / WHEEL_REV log lines remain accurate forensics. The
+        events are dropped at the forwarding step, not the observation step.
+        """
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(
+            debounce_module, drop_hires=True, diagnose_wheel=True,
+        )
+        # Drive a hi-res burst — none should reach uinput, but diag should
+        # have recorded each one.
+        for _ in range(3):
+            mouse.process_event(make_wheel_event(ecodes.REL_WHEEL_HI_RES, -15))
+        assert uinput.write_event.call_count == 0
+        # Diagnostics observed all three events (proxy: total_events incremented)
+        diag = mouse._wheel_diag
+        assert diag is not None
+        assert diag.burst_count == 3  # all three events observed
+
+
 class TestWheelSuppressorReplay:
     """End-to-end replay tests against statistics derived from the captured
     production log (`/var/log/mouse-filter/debounce.log`, recent window).

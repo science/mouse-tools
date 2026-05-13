@@ -6,7 +6,8 @@ Mouse management utilities for Linux, built on evdev. A single `mouse-filter` da
 
 - **Button remapping** — Remaps mouse buttons to keyboard keys (e.g., forward/back to volume up/down). A lightweight replacement for input-remapper when all you need is simple button remaps.
 - **Button debounce (opt-in)** — Suppresses phantom button releases on worn Logitech (and other) mice with bouncing micro-switches. Off by default; enable with `--debounce` if your hardware needs it.
-- **Wheel-bounce suppression (opt-in)** — Drops hardware-rebound wheel events on smooth-scroll wheels (e.g., Logitech MX 2 with detents disabled). Catches both cross-direction (sign-flip) and same-direction (re-burst) rebounds. Off by default; enable with `--wheel-suppress`. Toggle live with `mouse-suppress on|off|toggle`.
+- **Wheel hi-res drop (`--wheel-drop-hires`)** — Drops `REL_WHEEL_HI_RES` events at the forwarding step, eliminating sub-detent phantoms (encoder noise, mechanical micro-rebounds) entirely. Apps fall back to the notch (`REL_WHEEL`) for scroll signal. The current production default for the Logitech MX Anywhere 2S.
+- **Wheel-bounce suppression (legacy, opt-in)** — Software predicate that drops Type A (sign-flip reversal) and Type B (same-direction re-burst) rebounds on smooth-scroll wheels. Superseded by `--wheel-drop-hires` for the MX 2S; retained for hardware where dropping the hi-res axis isn't acceptable. Enable with `--wheel-suppress`. Toggle live with `mouse-suppress on|off|toggle`.
 
 ## The Bounce Problem (when --debounce is needed)
 
@@ -39,7 +40,15 @@ Remap mouse buttons to keyboard keys using `--remap`. Remapped buttons bypass de
 
 The remap target keycodes are injected into the virtual uinput device's capability list, since the physical mouse doesn't advertise keyboard keys like `KEY_VOLUMEUP`.
 
-### Wheel-Bounce Suppression (opt-in via `--wheel-suppress`)
+### Wheel Hi-Res Drop (`--wheel-drop-hires`)
+
+Logitech smooth-scroll wheels emit two parallel event streams: `REL_WHEEL` (one event per detent click, ±1) and `REL_WHEEL_HI_RES` (multiple events per detent for smooth-scroll animation, ±120 in default mode or ±15 in Solaar's low-res mode). Sub-detent phantoms — encoder noise, mechanical micro-rebounds, SmartShift clutch oscillation — appear *only* on the hi-res axis with no notch event behind them.
+
+`--wheel-drop-hires` discards `REL_WHEEL_HI_RES` events at the uinput forwarding step. Diagnostics still observe them (so `WHEEL_BURST_END` / `WHEEL_REV` logs remain accurate forensics), but they never reach apps. The notch axis (`REL_WHEEL`) flows through as normal — Firefox, Chrome, etc. fall back to it as their scroll signal source, typically at 3 lines per click. Combine with `--wheel-multiplier N` if you want a different per-detent scroll distance.
+
+This is the current production default. It's a strict subset of the wheel-suppress strategy below — no decision logic, no cooldown windows, no false-positive risk. The trade-off is loss of smooth-scroll inter-detent animation; the page steps by full lines per click instead of interpolating.
+
+### Wheel-Bounce Suppression (legacy, opt-in via `--wheel-suppress`)
 
 Smooth-scroll wheels (Logitech MX 2 with detents disabled) exhibit hardware-level rebound after a scroll burst:
 

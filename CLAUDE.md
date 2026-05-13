@@ -5,7 +5,9 @@
 A collection of mouse management utilities for Linux, built on evdev. A single `mouse-filter` daemon handles:
 - **Button remapping** — Remaps mouse buttons to keyboard keys (e.g., forward/back → volume up/down). Replaces input-remapper for simple mouse button remaps with zero additional overhead.
 - **Button debounce (opt-in via `--debounce`)** — Suppresses hardware switch bounce (worn Omron micro-switches) that causes phantom releases during drags and false double-clicks. Off by default; the current production mouse hardware does not bounce. The code path is preserved so it can be re-enabled if a future mouse needs it.
-- **Wheel-bounce suppression (opt-in via `--wheel-suppress`)** — Drops Type A (single-step sign-flip reversal) and Type B (same-direction re-burst) hardware rebounds on smooth-scroll wheels (Logitech MX 2 with detents disabled). Tunable via `--wheel-cooldown-ms`, `--wheel-cooldown-ratio`, `--wheel-min-primary`, `--wheel-bounce-max-total`, `--wheel-rev-window-ms`, `--wheel-quiet-ms`. Toggle live via `mouse-suppress on|off|toggle` (SIGUSR2 — auth-free via the polkit rule install.sh deploys).
+- **Wheel hi-res drop (`--wheel-drop-hires`)** — Production default. Drops `REL_WHEEL_HI_RES` events at the forwarding step. Sub-detent phantoms (encoder noise, mechanical micro-rebounds) appear only on the hi-res axis with no notch event behind them, so dropping the axis eliminates the entire phantom class with no decision logic. Apps fall back to `REL_WHEEL` notch events for scroll signal — typically 3 lines per detent in Firefox. Trade-off: loss of smooth-scroll animation between detents.
+- **Wheel-bounce suppression (legacy, opt-in via `--wheel-suppress`)** — Drops Type A (single-step sign-flip reversal) and Type B (same-direction re-burst) hardware rebounds on smooth-scroll wheels. Superseded by `--wheel-drop-hires` for the MX 2S. Tunable via `--wheel-cooldown-ms`, `--wheel-cooldown-ratio`, `--wheel-min-primary`, `--wheel-bounce-max-total`, `--wheel-rev-window-ms`, `--wheel-quiet-ms`. Toggle live via `mouse-suppress on|off|toggle` (SIGUSR2 — auth-free via the polkit rule install.sh deploys).
+- **Wheel multiplier (`--wheel-multiplier N`)** — Scales forwarded wheel event values by N. Default 1. Combine with `--wheel-drop-hires` for tuning per-detent scroll distance.
 
 ## Architecture
 
@@ -131,10 +133,10 @@ sudo ./run.sh --diagnose-move --stats-interval 30
 
 ### Run manually
 ```bash
-sudo ./run.sh                                    # default: remaps + wheel-suppress + diagnose-wheel
+sudo ./run.sh                                    # default: remaps + drop-hires + diagnose-wheel
 sudo ./run.sh --quiet                            # production mode
 sudo ./run.sh --debounce --threshold 70          # enable debounce (bouncy hardware)
-sudo ./mouse-filter --wheel-suppress             # direct invocation, suppress only
+sudo ./mouse-filter --wheel-suppress             # legacy software suppression
 ```
 
 ### Toggle wheel suppression at runtime

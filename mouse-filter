@@ -872,7 +872,8 @@ class DelayedDebouncedMouse:
                  wheel_rev_window_ms=280, wheel_cooldown_ratio=0.5,
                  wheel_min_primary=360, wheel_bounce_max_total=300,
                  wheel_quiet_ms=200, wheel_type_b=False,
-                 wheel_max_cascade_depth=0, wheel_multiplier=1):
+                 wheel_max_cascade_depth=0, wheel_multiplier=1,
+                 wheel_drop_hires=False):
         self.device = device
         self.threshold_s = threshold_ms / 1000.0
         self.button_remap = button_remap or {}  # {src_code: dst_code}
@@ -912,6 +913,12 @@ class DelayedDebouncedMouse:
         # each forwarded REL_WHEEL / REL_WHEEL_HI_RES event has its value
         # scaled. Suppression decisions still operate on the original.
         self.wheel_multiplier = max(1, int(wheel_multiplier))
+        # Drop REL_WHEEL_HI_RES events at the forwarding step. Sub-detent
+        # phantoms (encoder noise / mechanical micro-rebounds) live entirely
+        # on the hi-res axis with no notch event behind them, so dropping
+        # the axis eliminates them without affecting real detent crossings.
+        # Diagnostics still observe dropped events.
+        self.wheel_drop_hires = wheel_drop_hires
 
         # Movement diagnostics (only when --diagnose-move is active)
         self._move_diag = MoveDiagnostics(lag_threshold_ms=lag_threshold_ms) if diagnose_move else None
@@ -1029,6 +1036,15 @@ class DelayedDebouncedMouse:
                     f"(suppressed_total={self._wheel_suppressor.suppressed_total})",
                     also_print=False)
                 return False
+
+        # Drop hi-res wheel axis at the forwarding boundary. Diagnostics
+        # already observed the event above, so logs remain accurate; we
+        # just don't write it to uinput. This eliminates sub-detent
+        # phantoms (which only ever appear on the hi-res axis) at the cost
+        # of smooth-scroll animation between detents.
+        if is_wheel and self.wheel_drop_hires \
+                and event.code == ecodes.REL_WHEEL_HI_RES:
+            return False
 
         # Wheel multiplier: scale forwarded value when the user has reduced
         # hardware-level scroll resolution (via Solaar) and wants the per-
@@ -1332,6 +1348,15 @@ def main():
                              "low-res mode ignores sub-detent bounces but "
                              "feels slow; this puts the perceived speed back. "
                              "Try 2 or 3.")
+    parser.add_argument("--wheel-drop-hires", action="store_true",
+                        help="Drop REL_WHEEL_HI_RES events at the forwarding "
+                             "step. Sub-detent phantoms (encoder noise, "
+                             "mechanical micro-rebounds) appear only on the "
+                             "hi-res axis with no notch event behind them, "
+                             "so dropping the axis eliminates them entirely. "
+                             "Apps fall back to the notch (REL_WHEEL) for "
+                             "scroll signal. Trade-off: loss of smooth-scroll "
+                             "animation between detents.")
     args = parser.parse_args()
 
     # Parse button remaps
@@ -1386,6 +1411,7 @@ def main():
         wheel_type_b=args.wheel_type_b,
         wheel_max_cascade_depth=args.wheel_max_cascade_depth,
         wheel_multiplier=args.wheel_multiplier,
+        wheel_drop_hires=args.wheel_drop_hires,
     )
     for dev in devices:
         try:
@@ -1461,6 +1487,9 @@ def main():
         log(f"  Wheel diagnostics: ENABLED (logging to {LOG_FILE})")
     log(f"  Wheel multiplier:  {args.wheel_multiplier}x  "
         f"(forwarded wheel event values scaled)",
+        also_print=not q)
+    log(f"  Wheel drop hi-res: {'ON' if args.wheel_drop_hires else 'off'}  "
+        f"(REL_WHEEL_HI_RES axis dropped before uinput)",
         also_print=not q)
     log(f"  Wheel suppress:    {'ON' if args.wheel_suppress else 'OFF'}  "
         f"(toggle: systemctl kill -s SIGUSR2 mouse-filter.service)",
