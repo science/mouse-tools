@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""wheel-timing-probe — read-only diagnostic for the "two-state" scroll symptom.
+
+Symptom under investigation: scrolling feels like it has a fast state and a
+slow state. A hard flick ("throw") puts it in fast mode for a while, then it
+decays back to slow when the wheel is left idle.
+
+This probe taps the device X11/Wayland actually consumes (the post-filter
+"debounced ..." uinput clone) and prints a compact per-window summary of the
+wheel stream so you can SEE the state and tell apart the two causes:
+
+  * FLYWHEEL COAST (free-spin momentum): after you flick and LIFT YOUR FINGER,
+    events keep streaming on their own for seconds, decaying in rate. The
+    "active windows after release" count climbs with no input from you.
+
+  * VELOCITY-PROPORTIONAL / ACCELERATION: per-event hi-res magnitude inflates
+    in the fast state — max_ev and units/event grow well past one detent (120),
+    rather than just *more* notches arriving.
+
+Each window line (printed only while the wheel is active) shows:
+    t=+s.s  evts=N  rate=Hz  units=hi-res-sum  notch=REL_WHEEL-count
+    ev/u=units-per-event  max_ev=largest-single-hi-res-value  [COAST? markers]
+
+Usage:
+    sudo ./wheel-timing-probe                  # auto-find the filtered 3S
+    sudo ./wheel-timing-probe --window-ms 200
+    sudo ./wheel-timing-probe --device /dev/input/event29
+
+Suggested experiment:
+  1) BASELINE: from rest, roll ONE detent slowly. Note units/event and max_ev.
+  2) COAST:    flick hard, then LIFT your finger and DO NOT touch the wheel.
+               Count how many windows keep printing on their own, and watch rate decay.
+  3) AMPLIFY:  during the post-flick window, make a deliberate TINY nudge and
+               compare units/event & max_ev to the baseline.
+Ctrl-C for a summary.
+"""
+import argparse
+import sys
+import time
+
+from evdev import InputDevice, ecodes, list_devices
+
+DETENT = 120  # hi-res units per logical detent
+
+
+def find_device(name_substr):
+    for path in list_devices():
+        try:
+            dev = InputDevice(path)
+        except Exception:
+            continue
+        if name_substr.lower() in dev.name.lower():
+            return dev
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--device", help="explicit /dev/input/eventN")
+    ap.add_argument("--name", default="debounced MX Anywhere 3S",
+                    help="substring to match device name (default: the filtered 3S)")
+    ap.add_argument("--window-ms", type=float, default=200.0,
+                    help="summary window size (default 200ms)")
+    ap.add_argument("--idle-ms", type=float, default=400.0,
+                    help="gap that closes an active stream and prints IDLE (default 400ms)")
+    ap.add_argument("--log", help="also write all output to this file (for sharing)")
+    args = ap.parse_args()
+
+    logf = open(args.log, "w") if args.log else None
+
+    def out(line=""):
+        print(line)
+        if logf:
+            logf.write(line + "\n")
+            logf.flush()
+
+    if args.device:
+        dev = InputDevice(args.device)
+    else:
+        dev = find_device(args.name)
+        if dev is None:
+            print(f"No input device matching {args.name!r}. Candidates:", file=sys.stderr)
+            for p in list_devices():
+                try:
+                    print(f"  {p}  {InputDevice(p).name}", file=sys.stderr)
+                except Exception:
+                    pass
+            sys.exit(1)
+
+    win = args.window_ms / 1000.0
+    idle = args.idle_ms / 1000.0
+
+    out(f"Probing: {dev.path}  ({dev.name})")
+    out(f"window={args.window_ms:.0f}ms  idle-gap={args.idle_ms:.0f}ms  (detent={DETENT} units)")
+    out("Roll the wheel. Lines print per active window; gaps mark IDLE.\n")
+    out("  t=+s.ss  evts  rate(Hz)  units   notch  units/ev  max_ev   note")
+
+    # per-window accumulators
+    w_start = None
+    w_evts = w_units = w_notch = w_maxev = 0
+    last_event_mono = None
+    stream_start = None         # when the current active stream began
+    windows_since_input = 0     # heuristic coast counter (windows after a quiet open)
+
+    # totals
+    t_evts = t_max_units_per_ev = t_max_ev = 0
+    t_windows = 0
+
+    def flush_window(now):
+        nonlocal w_start, w_evts, w_units, w_notch, w_maxev
+        nonlocal t_evts, t_max_units_per_ev, t_max_ev, t_windows
+        if not w_evts:
+            w_start = now
+            return
+        dur = max(1e-3, now - w_start)
+        rate = w_evts / dur
+        upe = abs(w_units) / w_evts if w_evts else 0
+        rel = (now - stream_start) if stream_start else 0.0
+        note = ""
+        if w_maxev > DETENT:
+            note += " HOT(max_ev>detent)"
+        if rate > 80:
+            note += " FAST"
+        out(f"  t=+{rel:5.2f}  {w_evts:4d}  {rate:7.1f}  {w_units:6d}  "
+            f"{w_notch:5d}  {upe:7.1f}  {w_maxev:6d} {note}")
+        t_evts += w_evts
+        t_windows += 1
+        t_max_units_per_ev = max(t_max_units_per_ev, upe)
+        t_max_ev = max(t_max_ev, w_maxev)
+        w_start = now
+        w_evts = w_units = w_notch = w_maxev = 0
+
+    try:
+        for ev in dev.read_loop():
+            if ev.type != ecodes.EV_REL:
+                continue
+            if ev.code not in (ecodes.REL_WHEEL, ecodes.REL_WHEEL_HI_RES):
+                continue
+            now = time.monotonic()
+
+            # idle close-out
+            if last_event_mono is not None and (now - last_event_mono) > idle:
+                flush_window(now)
+                if stream_start is not None:
+                    out(f"  ---- IDLE { (now-last_event_mono)*1000:.0f}ms ----")
+                stream_start = None
+            if stream_start is None:
+                stream_start = now
+                w_start = now
+
+            if ev.code == ecodes.REL_WHEEL_HI_RES:
+                w_units += ev.value
+                w_maxev = max(w_maxev, abs(ev.value))
+                w_evts += 1
+            else:  # REL_WHEEL notch
+                w_notch += 1
+                w_evts += 1
+
+            last_event_mono = now
+            if w_start is not None and (now - w_start) >= win:
+                flush_window(now)
+    except KeyboardInterrupt:
+        flush_window(time.monotonic())
+        out("\n--- summary ---")
+        out(f"active windows:            {t_windows}")
+        out(f"max units/event seen:      {t_max_units_per_ev:.1f}  (one detent = {DETENT})")
+        out(f"max single hi-res value:   {t_max_ev}")
+        out("Interpretation:")
+        out("  * Streams that keep printing AFTER you lifted your finger = flywheel coast (free-spin momentum).")
+        out("  * units/event & max_ev far above 120 in the fast state = velocity-proportional inflation.")
+        out("  * If neither, and magnitude is steady, look upstream (driver/compositor) instead.")
+        if logf:
+            logf.close()
+
+
+if __name__ == "__main__":
+    main()

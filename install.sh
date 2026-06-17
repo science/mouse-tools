@@ -80,12 +80,13 @@ Type=simple
 # Debounce: ON at 70ms — older MX Anywhere 2S unit shows wear-driven
 # Omron left-click bounce (drag-select gets reset by phantom release+
 # re-press within ~40-70ms). Drop --debounce to disable.
-# Wheel: stock — no multiplier, no suppress, no drop-hires.
-# Currently running a second MX Anywhere 2S unit (the first had
-# sub-detent pre-roll phantoms). --diagnose-wheel preserved as
-# read-only observability so the second unit can be evaluated
-# against the same WHEEL_REV / WHEEL_BURST_END data.
-ExecStart=$INSTALL_BIN --quiet --debounce --threshold 70 --diagnose-wheel --log-dir $LOG_DIR --remap BTN_EXTRA=KEY_VOLUMEUP --remap BTN_SIDE=KEY_VOLUMEDOWN --remap BTN_MIDDLE=KEY_MUTE
+# Wheel: --wheel-scale 0.1 damps scroll to ~1/10 speed universally
+# (GUI hi-res AND terminal notches). The MX Anywhere 3S free-spin
+# wheel (Solaar hires-smooth-resolution=True) reports full-rate
+# velocity-proportional hi-res, which terminals turn into runaway
+# scroll; scaling at the filter tames it everywhere. --diagnose-wheel
+# preserved as read-only observability (WHEEL_REV / WHEEL_BURST_END).
+ExecStart=$INSTALL_BIN --quiet --debounce --threshold 70 --diagnose-wheel --wheel-scale 0.1 --log-dir $LOG_DIR --remap BTN_EXTRA=KEY_VOLUMEUP --remap BTN_SIDE=KEY_VOLUMEDOWN --remap BTN_MIDDLE=KEY_MUTE
 Restart=on-failure
 RestartSec=3
 

@@ -873,7 +873,7 @@ class DelayedDebouncedMouse:
                  wheel_min_primary=360, wheel_bounce_max_total=300,
                  wheel_quiet_ms=200, wheel_type_b=False,
                  wheel_max_cascade_depth=0, wheel_multiplier=1,
-                 wheel_drop_hires=False):
+                 wheel_drop_hires=False, wheel_scale=1.0):
         self.device = device
         self.threshold_s = threshold_ms / 1000.0
         self.button_remap = button_remap or {}  # {src_code: dst_code}
@@ -913,6 +913,15 @@ class DelayedDebouncedMouse:
         # each forwarded REL_WHEEL / REL_WHEEL_HI_RES event has its value
         # scaled. Suppression decisions still operate on the original.
         self.wheel_multiplier = max(1, int(wheel_multiplier))
+        # Fractional wheel scaling — universal scroll-speed damping. Composes
+        # with wheel_multiplier (effective factor = multiplier * scale), so a
+        # scale < 1 slows scrolling everywhere (GUI hi-res AND terminal notch
+        # events). A per-axis residual carries the truncated fraction so
+        # fractional scaling is smooth and drift-free; truncation toward zero
+        # guarantees damping never over-scrolls. Applies to vertical wheel
+        # only (REL_WHEEL / REL_WHEEL_HI_RES), matching wheel_multiplier scope.
+        self.wheel_scale = float(wheel_scale) if wheel_scale and wheel_scale > 0 else 1.0
+        self._wheel_resid = {}  # event.code -> float carry
         # Drop REL_WHEEL_HI_RES events at the forwarding step. Sub-detent
         # phantoms (encoder noise / mechanical micro-rebounds) live entirely
         # on the hi-res axis with no notch event behind them, so dropping
@@ -1046,13 +1055,27 @@ class DelayedDebouncedMouse:
                 and event.code == ecodes.REL_WHEEL_HI_RES:
             return False
 
-        # Wheel multiplier: scale forwarded value when the user has reduced
-        # hardware-level scroll resolution (via Solaar) and wants the per-
-        # click scroll distance compensated back up.
-        if is_wheel and self.wheel_multiplier > 1:
-            event = evdev.InputEvent(event.sec, event.usec, event.type,
-                                     event.code,
-                                     event.value * self.wheel_multiplier)
+        # Wheel scaling: scale the forwarded value by multiplier * scale.
+        # multiplier (>1) compensates a reduced hardware resolution back up;
+        # scale (<1) damps scroll speed universally. A per-axis residual
+        # carries the truncated fraction so fractional scaling stays smooth
+        # and decimates notch events correctly (e.g. scale=1/3 → ~1 notch out
+        # per 3 in). Suppression/diagnostics above already saw the original.
+        if is_wheel:
+            factor = self.wheel_multiplier * self.wheel_scale
+            if factor != 1.0:
+                acc = self._wheel_resid.get(event.code, 0.0)
+                # Drop leftover carry from the opposite direction so a reversal
+                # responds immediately instead of being eaten by old residual.
+                if acc != 0.0 and (acc > 0) != (event.value > 0):
+                    acc = 0.0
+                acc += event.value * factor
+                out = int(acc)  # truncate toward zero; preserves sign
+                self._wheel_resid[event.code] = acc - out
+                if out == 0:
+                    return False  # scaled below one unit; fold into residual
+                event = evdev.InputEvent(event.sec, event.usec, event.type,
+                                         event.code, out)
 
         # Button remapping: transform code and forward immediately (no debounce)
         if event.type == ecodes.EV_KEY and event.code in self.button_remap:
@@ -1348,6 +1371,14 @@ def main():
                              "low-res mode ignores sub-detent bounces but "
                              "feels slow; this puts the perceived speed back. "
                              "Try 2 or 3.")
+    parser.add_argument("--wheel-scale", type=float, default=1.0,
+                        help="Scale forwarded vertical wheel values by this "
+                             "fraction for universal scroll-speed damping "
+                             "(default: 1.0, no change). E.g. 0.333 scrolls at "
+                             "~1/3 speed everywhere (GUI hi-res AND terminal "
+                             "notches). A per-axis residual accumulator keeps "
+                             "fractional scaling smooth and drift-free. "
+                             "Composes with --wheel-multiplier.")
     parser.add_argument("--wheel-drop-hires", action="store_true",
                         help="Drop REL_WHEEL_HI_RES events at the forwarding "
                              "step. Sub-detent phantoms (encoder noise, "
@@ -1412,6 +1443,7 @@ def main():
         wheel_max_cascade_depth=args.wheel_max_cascade_depth,
         wheel_multiplier=args.wheel_multiplier,
         wheel_drop_hires=args.wheel_drop_hires,
+        wheel_scale=args.wheel_scale,
     )
     for dev in devices:
         try:

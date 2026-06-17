@@ -3611,3 +3611,90 @@ class TestUserTag:
 
         msg = mock_log.call_args.args[0]
         assert msg == "USER_TAG: rebound-felt"
+
+
+class TestWheelScale:
+    """Fractional wheel scaling — universal scroll-speed damping.
+
+    `wheel_scale` (float) scales forwarded REL_WHEEL / REL_WHEEL_HI_RES values
+    and composes with the legacy integer `wheel_multiplier`. A per-axis residual
+    accumulator carries the truncated fraction so fractional scaling stays
+    drift-free and decimates notch events correctly (e.g. scale=0.5 → 1 notch
+    out per 2 in). Truncation toward zero guarantees damping never over-scrolls.
+    """
+
+    def _make_mouse(self, debounce_module, wheel_scale=1.0, wheel_multiplier=1):
+        from evdev import ecodes  # noqa: F401
+
+        mock_device = MagicMock()
+        mock_device.name = "Test Mouse"
+        mock_device.fd = 99
+        mock_uinput = MagicMock()
+
+        with patch.object(debounce_module, 'UInput') as mock_uinput_class:
+            mock_uinput_class.from_device.return_value = mock_uinput
+            mouse = debounce_module.DelayedDebouncedMouse(
+                mock_device, 60, quiet=True, debounce_enabled=False,
+                wheel_scale=wheel_scale, wheel_multiplier=wheel_multiplier,
+            )
+        return mouse, mock_uinput
+
+    def _last_value(self, uinput):
+        return uinput.write_event.call_args[0][0].value
+
+    def test_scale_one_is_passthrough(self, debounce_module):
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, wheel_scale=1.0)
+        ev = make_event(ecodes.EV_REL, ecodes.REL_WHEEL_HI_RES, 120)
+        assert mouse.process_event(ev) is True
+        uinput.write_event.assert_called_once_with(ev)
+
+    def test_hires_scaled_by_half(self, debounce_module):
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, wheel_scale=0.5)
+        ev = make_event(ecodes.EV_REL, ecodes.REL_WHEEL_HI_RES, 120)
+        assert mouse.process_event(ev) is True
+        assert self._last_value(uinput) == 60
+
+    def test_notch_decimated_by_half(self, debounce_module):
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, wheel_scale=0.5)
+        ev1 = make_event(ecodes.EV_REL, ecodes.REL_WHEEL, 1)
+        assert mouse.process_event(ev1) is False        # 0.5 accumulated, dropped
+        uinput.write_event.assert_not_called()
+        ev2 = make_event(ecodes.EV_REL, ecodes.REL_WHEEL, 1)
+        assert mouse.process_event(ev2) is True          # residual hits 1.0, emit
+        assert self._last_value(uinput) == 1
+
+    def test_subunit_hires_accumulates(self, debounce_module):
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, wheel_scale=0.25)
+        ev = make_event(ecodes.EV_REL, ecodes.REL_WHEEL_HI_RES, 2)   # 0.5
+        assert mouse.process_event(ev) is False
+        ev2 = make_event(ecodes.EV_REL, ecodes.REL_WHEEL_HI_RES, 2)  # total 1.0
+        assert mouse.process_event(ev2) is True
+        assert self._last_value(uinput) == 1
+
+    def test_direction_reversal_resets_residual(self, debounce_module):
+        from evdev import ecodes
+        mouse, _ = self._make_mouse(debounce_module, wheel_scale=0.5)
+        assert mouse.process_event(make_event(ecodes.EV_REL, ecodes.REL_WHEEL, 1)) is False
+        assert mouse._wheel_resid[ecodes.REL_WHEEL] == pytest.approx(0.5)
+        # reverse: positive residual is cleared before applying the negative event
+        assert mouse.process_event(make_event(ecodes.EV_REL, ecodes.REL_WHEEL, -1)) is False
+        assert mouse._wheel_resid[ecodes.REL_WHEEL] == pytest.approx(-0.5)
+
+    def test_movement_unaffected_by_scale(self, debounce_module):
+        from evdev import ecodes
+        mouse, uinput = self._make_mouse(debounce_module, wheel_scale=0.5)
+        ev = make_event(ecodes.EV_REL, ecodes.REL_X, 5)
+        assert mouse.process_event(ev) is True
+        uinput.write_event.assert_called_once_with(ev)
+
+    def test_multiplier_composes_with_scale(self, debounce_module):
+        from evdev import ecodes
+        # legacy integer multiplier still scales up when scale=1.0
+        mouse, uinput = self._make_mouse(debounce_module, wheel_multiplier=3)
+        ev = make_event(ecodes.EV_REL, ecodes.REL_WHEEL, 1)
+        assert mouse.process_event(ev) is True
+        assert self._last_value(uinput) == 3
